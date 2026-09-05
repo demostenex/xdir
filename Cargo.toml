@@ -1,0 +1,9 @@
+[package]
+name = "xdir"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Núcleo do xdir (Milestone 0): filesystem e navegação sem interface gráfica"
+license = "MIT"
+
+[dependencies]
