@@ -1,0 +1,154 @@
+import { StandardListView } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "xdir";
+    // `preferred-width`/`preferred-height` are hints for the *initial*
+    // size only. Plain `width`/`height` on the root Window are a fixed-size
+    // constraint in Slint (documented: the window manager is told
+    // min-width == max-width == width), which made i3 treat this window as
+    // non-resizable in tiling. A normal, cooperative X11 window must leave
+    // the window manager as the authority over its actual geometry.
+    preferred-width: 640px;
+    preferred-height: 420px;
+    background: #1e1e2e;
+
+    in property <string> path-text: "";
+    in property <string> status-text: "0 items";
+    in property <[StandardListViewItem]> entries;
+
+    // UI never touches the filesystem or Navigation: every input converges
+    // on one of these two callbacks, which the app layer turns into an
+    // Action against AppState.
+    callback key-action(string);
+    callback selection-changed(int);
+    // `is-left` lets the Rust side ignore right/middle presses outright
+    // when tracking double-clicks, without needing to know the Slint
+    // button enum.
+    callback item-pressed(int, bool);
+
+    // Moves the list's real selection (not just a bound property), which is
+    // the only path that also triggers StandardListView's own
+    // bring-into-view scrolling. A plain one-way `current-item` binding
+    // does not scroll the viewport.
+    public function set-selection(index: int) {
+        if (index < 0) {
+            current-list.current-item = -1;
+        } else {
+            current-list.set-current-item(index);
+        }
+    }
+
+    // Called whenever the listing changes (new directory), so a viewport
+    // scrolled deep into the previous directory's list doesn't leak into
+    // the newly loaded one.
+    public function reset-scroll() {
+        current-list.viewport-y = 0px;
+    }
+
+    public function focus-list() {
+        focus-scope.focus();
+    }
+
+    VerticalLayout {
+        Rectangle {
+            height: 30px;
+            background: #181825;
+            Text {
+                text: root.path-text;
+                color: #cdd6f4;
+                x: 10px;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #313244;
+        }
+
+        Rectangle {
+            focus-scope := FocusScope {
+                width: 100%;
+                height: 100%;
+
+                key-pressed(event) => {
+                    // Shift/Ctrl/Alt/Meta(Super) combinations are never
+                    // xdir shortcuts — plain input only. This leaves
+                    // Mod+hjkl and Mod+arrows to the window manager (e.g.
+                    // i3), Shift+arrows free for future multi-select, and
+                    // Ctrl/Alt free for future bindings. Arrow keys are
+                    // aliases of the vim keys: both converge on the exact
+                    // same `key-action` text, so the Rust side (and the
+                    // `Action` enum it maps to) never has to know arrows
+                    // exist.
+                    if (event.modifiers.shift || event.modifiers.control
+                        || event.modifiers.alt || event.modifiers.meta) {
+                        reject
+                    } else if (event.text == "k" || event.text == Key.UpArrow) {
+                        root.key-action("k");
+                        accept
+                    } else if (event.text == "j" || event.text == Key.DownArrow) {
+                        root.key-action("j");
+                        accept
+                    } else if (event.text == "h" || event.text == Key.LeftArrow) {
+                        root.key-action("h");
+                        accept
+                    } else if (event.text == "l" || event.text == Key.RightArrow || event.text == "\n") {
+                        root.key-action("l");
+                        accept
+                    } else {
+                        reject
+                    }
+                }
+
+                current-list := StandardListView {
+                    width: 100%;
+                    height: 100%;
+                    model: root.entries;
+
+                    // Fires only when the built-in click handling actually
+                    // changed the selection (it no-ops on a repeat click of
+                    // the already-selected row) — used purely to mirror the
+                    // resulting selection into AppState.
+                    current-item-changed(index) => { root.selection-changed(index); }
+
+                    // Fires on every mouse press on a row regardless of
+                    // whether the selection changed, which is what a repeat
+                    // click needs — used only for double-click timing on
+                    // the Rust side.
+                    item-pointer-event(index, event, position) => {
+                        if (event.kind == PointerEventKind.down) {
+                            root.item-pressed(index, event.button == PointerEventButton.left);
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #313244;
+        }
+
+        Rectangle {
+            height: 24px;
+            background: #181825;
+            Text {
+                text: root.status-text;
+                color: #a6adc8;
+                x: 10px;
+                vertical-alignment: center;
+                font-size: 12px;
+            }
+            Text {
+                text: "NORMAL";
+                color: #a6adc8;
+                x: parent.width - self.width - 10px;
+                vertical-alignment: center;
+                font-size: 12px;
+            }
+        }
+    }
+
+    forward-focus: focus-scope;
+}

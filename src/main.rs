@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
+use xdir::app::AppState;
 use xdir::core::navigation::Navigation;
 
 fn main() {
@@ -17,15 +18,10 @@ fn main() {
         }
     };
 
-    println!("xdir core (Milestone 0) — sem interface gráfica");
-    println!("current: {}", navigation.current_dir().display());
+    let state = AppState::new(navigation);
 
-    match navigation.entries() {
-        Ok(entries) => {
-            for entry in entries {
-                println!("  {}", entry.name().to_string_lossy());
-            }
-        }
-        Err(err) => eprintln!("xdir: erro ao ler diretório: {err}"),
+    if let Err(err) = xdir::ui::run(state) {
+        eprintln!("xdir: {err}");
+        std::process::exit(1);
     }
 }

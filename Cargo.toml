@@ -2,8 +2,17 @@
 name = "xdir"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "Núcleo do xdir (Milestone 0): filesystem e navegação sem interface gráfica"
+rust-version = "1.92"
+description = "xdir (Milestone 1B): primeira janela gráfica, Slint sobre o núcleo Milestone 0"
 license = "MIT"
 
 [dependencies]
+slint = { version = "1.17", default-features = false, features = [
+    "std",
+    "backend-winit-x11",
+    "renderer-software",
+    "compat-1-2",
+] }
+
+[build-dependencies]
+slint-build = "1.17"

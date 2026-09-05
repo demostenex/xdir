@@ -72,3 +72,9 @@ mudanças incrementais. Nenhuma abstração criada apenas por antecipação.
 ## Licença
 
 MIT — veja [`LICENSE`](LICENSE).
+
+A interface gráfica usa [Slint](https://slint.dev) sob a *Slint Royalty-free
+Desktop, Mobile and Web Applications License 2.0*, que permite uso em
+aplicações MIT como o xdir mediante atribuição pública:
+
+[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev)
