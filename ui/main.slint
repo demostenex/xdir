@@ -11,15 +11,26 @@ export component MainWindow inherits Window {
     preferred-width: 640px;
     preferred-height: 420px;
     background: #1e1e2e;
+    // xdir's standard typeface. Centralized here (not repeated per Text/
+    // widget) so it's inherited window-wide; the fontconfig family name
+    // confirmed installed on this machine's Nerd Font package is "MesloLGS
+    // Nerd Font Mono", not the shorter "MesloLGS NF" alias some installers
+    // register.
+    default-font-family: "MesloLGS Nerd Font Mono";
 
     in property <string> path-text: "";
     in property <string> status-text: "0 items";
     in property <[StandardListViewItem]> entries;
 
-    // UI never touches the filesystem or Navigation: every input converges
-    // on one of these two callbacks, which the app layer turns into an
-    // Action against AppState.
-    callback key-action(string);
+    // UI never touches the filesystem or Navigation, and never decides
+    // what a keystroke or click *means* — it only reports what happened.
+    // `key-input` forwards the pressed key's raw text (or, for the arrow
+    // keys, one of the "Up"/"Down"/"Left"/"Right" tags below — arrows are
+    // the one case only Slint can recognize, via its own `Key.*Arrow`
+    // constants) plus the raw modifier flags, and gets back whether the
+    // app layer consumed it (so unclaimed combinations, e.g. Mod+j, stay
+    // available to the window manager instead of being swallowed here).
+    callback key-input(string, bool, bool, bool, bool) -> bool;
     callback selection-changed(int);
     // `is-left` lets the Rust side ignore right/middle presses outright
     // when tracking double-clicks, without needing to know the Slint
@@ -71,30 +82,22 @@ export component MainWindow inherits Window {
                 width: 100%;
                 height: 100%;
 
+                // This handler *identifies* the key (including recognizing
+                // the arrows via Slint's own `Key.*Arrow` constants, which
+                // nothing outside Slint can do) and reports raw modifier
+                // flags — it does not decide what any combination means
+                // for xdir. That decision, and whether the event should be
+                // consumed, comes back from `root.key-input(...)`.
                 key-pressed(event) => {
-                    // Shift/Ctrl/Alt/Meta(Super) combinations are never
-                    // xdir shortcuts — plain input only. This leaves
-                    // Mod+hjkl and Mod+arrows to the window manager (e.g.
-                    // i3), Shift+arrows free for future multi-select, and
-                    // Ctrl/Alt free for future bindings. Arrow keys are
-                    // aliases of the vim keys: both converge on the exact
-                    // same `key-action` text, so the Rust side (and the
-                    // `Action` enum it maps to) never has to know arrows
-                    // exist.
-                    if (event.modifiers.shift || event.modifiers.control
-                        || event.modifiers.alt || event.modifiers.meta) {
-                        reject
-                    } else if (event.text == "k" || event.text == Key.UpArrow) {
-                        root.key-action("k");
-                        accept
-                    } else if (event.text == "j" || event.text == Key.DownArrow) {
-                        root.key-action("j");
-                        accept
-                    } else if (event.text == "h" || event.text == Key.LeftArrow) {
-                        root.key-action("h");
-                        accept
-                    } else if (event.text == "l" || event.text == Key.RightArrow || event.text == "\n") {
-                        root.key-action("l");
+                    if (event.text == Key.UpArrow) {
+                        if (root.key-input("Up", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                    } else if (event.text == Key.DownArrow) {
+                        if (root.key-input("Down", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                    } else if (event.text == Key.LeftArrow) {
+                        if (root.key-input("Left", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                    } else if (event.text == Key.RightArrow) {
+                        if (root.key-input("Right", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                    } else if (root.key-input(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) {
                         accept
                     } else {
                         reject

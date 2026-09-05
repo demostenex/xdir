@@ -9,4 +9,5 @@ pub enum Action {
     ActivateSelected,
     ActivateIndex(usize),
     GoParent,
+    ToggleHidden,
 }

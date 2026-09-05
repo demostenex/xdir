@@ -39,6 +39,10 @@ impl AppState {
         self.selected.and_then(|i| self.entries.get(i))
     }
 
+    pub fn show_hidden(&self) -> bool {
+        self.navigation.show_hidden()
+    }
+
     /// Applies `action`, the only way any part of this state changes.
     pub fn dispatch(&mut self, action: Action) {
         match action {
@@ -51,6 +55,7 @@ impl AppState {
                 self.activate_selected();
             }
             Action::GoParent => self.go_parent(),
+            Action::ToggleHidden => self.toggle_hidden(),
         }
     }
 
@@ -93,6 +98,32 @@ impl AppState {
     fn reload(&mut self) {
         self.entries = self.navigation.entries().unwrap_or_default();
         self.selected = initial_selection(&self.entries);
+    }
+
+    /// Flips `show_hidden` and reloads the current directory. Unlike
+    /// [`Self::reload`] (used when the directory itself changes, where
+    /// resetting to the first entry is the only sensible choice), this
+    /// keeps the same *entry* selected across the reload by its real path
+    /// — never by the index or by the text shown in the UI — falling back
+    /// to the first entry only if the previously selected one is no longer
+    /// listed (e.g. a dotfile that just got hidden again), or to no
+    /// selection if the directory is now empty.
+    fn toggle_hidden(&mut self) {
+        let selected_path = self
+            .selected_entry()
+            .map(|entry| entry.path().to_path_buf());
+
+        self.navigation
+            .set_show_hidden(!self.navigation.show_hidden());
+        self.entries = self.navigation.entries().unwrap_or_default();
+
+        self.selected = selected_path
+            .and_then(|path| {
+                self.entries
+                    .iter()
+                    .position(|entry| entry.path() == path.as_path())
+            })
+            .or_else(|| initial_selection(&self.entries));
     }
 }
 
@@ -234,5 +265,72 @@ mod tests {
         state.dispatch(Action::ActivateIndex(999));
         assert_eq!(state.selected(), Some(0));
         assert_eq!(state.current_dir(), dir.path());
+    }
+
+    #[test]
+    fn toggle_hidden_reveals_and_hides_dotfiles() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".hidden"), b"").unwrap();
+        fs::write(dir.path().join("visible.txt"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert!(!state.show_hidden());
+        assert_eq!(names(&state), vec!["visible.txt"]);
+
+        state.dispatch(Action::ToggleHidden);
+        assert!(state.show_hidden());
+        assert_eq!(names(&state), vec![".hidden", "visible.txt"]);
+
+        state.dispatch(Action::ToggleHidden);
+        assert!(!state.show_hidden());
+        assert_eq!(names(&state), vec!["visible.txt"]);
+    }
+
+    #[test]
+    fn toggle_hidden_preserves_selection_on_the_same_entry_by_path() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".hidden"), b"").unwrap();
+        fs::write(dir.path().join("visible.txt"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        // Only "visible.txt" is listed yet, so it's the one selected.
+        let selected_path = state.selected_entry().unwrap().path().to_path_buf();
+
+        state.dispatch(Action::ToggleHidden);
+
+        // ".hidden" now sorts before "visible.txt"; the selection must have
+        // followed "visible.txt" by identity, not stayed pinned to index 0.
+        assert_eq!(names(&state), vec![".hidden", "visible.txt"]);
+        assert_eq!(
+            state.selected_entry().unwrap().path().to_path_buf(),
+            selected_path
+        );
+    }
+
+    #[test]
+    fn toggle_hidden_falls_back_to_the_first_entry_when_the_selected_one_disappears() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".hidden"), b"").unwrap();
+        fs::write(dir.path().join("visible.txt"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::ToggleHidden); // show hidden: [".hidden", "visible.txt"]
+        state.dispatch(Action::SelectIndex(0)); // select ".hidden"
+
+        state.dispatch(Action::ToggleHidden); // hide again: ".hidden" disappears
+
+        assert_eq!(names(&state), vec!["visible.txt"]);
+        assert_eq!(state.selected(), Some(0));
+    }
+
+    #[test]
+    fn toggle_hidden_on_a_dotfile_only_directory_can_empty_or_repopulate_the_listing() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".only"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(state.selected(), None);
+
+        state.dispatch(Action::ToggleHidden);
+        assert_eq!(state.selected(), Some(0));
+
+        state.dispatch(Action::ToggleHidden);
+        assert_eq!(state.selected(), None);
     }
 }

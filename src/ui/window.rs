@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
 use crate::app::{Action, AppState};
+use crate::ui::input::{self, KeyStroke};
 
 slint::include_modules!();
 
@@ -75,20 +76,28 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     full_refresh(&state, &ui);
     ui.invoke_focus_list();
 
-    ui.on_key_action({
+    // `.slint` only names the physical key (a literal character, or one
+    // of the "Up"/"Down"/"Left"/"Right" tags it substitutes for the arrow
+    // keys it alone can recognize) and reports raw modifier flags; it
+    // never decides what any of that means. `KeyStroke::new` turns that
+    // into a toolkit-neutral value and `input::resolve` (the keymap) is
+    // the one place that says "j and Down both mean select-next". The
+    // returned bool tells `.slint` whether to consume the event
+    // (`Handled`) or leave it alone (`Ignored`), e.g. for the window
+    // manager.
+    ui.on_key_input({
         let state = state.clone();
         let ui = ui.as_weak();
-        move |text| {
+        move |raw, shift, control, alt, meta| {
             let ui = ui.unwrap();
-            let action = match text.as_str() {
-                "j" => Some(Action::SelectNext),
-                "k" => Some(Action::SelectPrevious),
-                "l" | "\n" => Some(Action::ActivateSelected),
-                "h" => Some(Action::GoParent),
-                _ => None,
+            let Some(stroke) = KeyStroke::new(&raw, shift, control, alt, meta) else {
+                return false;
             };
-            let Some(action) = action else { return };
+            let Some(action) = input::resolve(stroke) else {
+                return false;
+            };
             apply(&state, &ui, action);
+            true
         }
     });
 
@@ -132,7 +141,18 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
 }
 
 /// Runs `action` through `AppState` and syncs the UI: a full rebuild if the
-/// directory changed, or just the selection otherwise.
+/// directory or the entry list itself changed, or just the selection
+/// otherwise.
+///
+/// A directory change isn't the only way the entry list can change: e.g.
+/// `ToggleHidden` rewrites `entries()` in place without moving
+/// `current_dir()` at all. Comparing only the directory left a real bug —
+/// `.` correctly dispatched `ToggleHidden` (state and its own tests were
+/// right) but the list view and status text never refreshed, because
+/// `sync_selection` only calls `invoke_set_selection`, not `set_entries`.
+/// Comparing the entry *count* alongside the directory catches that case
+/// too, without full_refresh needing to know which actions can grow or
+/// shrink the list.
 ///
 /// Neither branch may hold a live `Ref`/`RefMut` on `state` while calling
 /// into `ui`: `invoke_set_selection` synchronously triggers
@@ -146,10 +166,19 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
 /// the plain values it needs, so the borrow is gone before any `ui.*`/
 /// `invoke_*` call happens.
 fn apply(state: &Rc<RefCell<AppState>>, ui: &MainWindow, action: Action) {
-    let dir_before = state.borrow().current_dir().to_path_buf();
+    let (dir_before, count_before) = {
+        let st = state.borrow();
+        (st.current_dir().to_path_buf(), st.entries().len())
+    };
     state.borrow_mut().dispatch(action);
-    let dir_changed = state.borrow().current_dir() != dir_before;
-    if dir_changed {
+    let (dir_changed, count_changed) = {
+        let st = state.borrow();
+        (
+            st.current_dir() != dir_before,
+            st.entries().len() != count_before,
+        )
+    };
+    if dir_changed || count_changed {
         full_refresh(state, ui);
     } else {
         sync_selection(state, ui);
