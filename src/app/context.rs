@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::app::FilePreview;
 use crate::core::filesystem;
 use crate::model::{EntryKind, FileEntry};
 
@@ -75,17 +76,17 @@ impl ParentContext {
 
 /// What to show in PREVIEW about whatever is currently selected in CURRENT.
 ///
-/// This is Milestone 3's preview *context* only: which kind of thing is
-/// selected, and — for a directory — its immediate children. It never reads
-/// file contents, never follows symlinks, never does MIME/thumbnail work;
-/// that's preview *content*, Milestone 4's job.
+/// Directory/Symlink/Other stay pure *context* (Milestone 3): no file
+/// content, no MIME, no thumbnail. `File` carries Milestone 4A's one piece
+/// of real *content*: a bounded text preview. A symlink is never followed
+/// to reach it — even a symlink to a text file stays `Symlink`, not `File`.
 #[derive(Debug, Clone, Default)]
 pub enum PreviewContext {
     #[default]
     None,
     Directory(Vec<FileEntry>),
     DirectoryUnavailable,
-    File,
+    File(FilePreview),
     Symlink,
     Other,
 }
@@ -101,7 +102,7 @@ impl PreviewContext {
                 Ok(children) => PreviewContext::Directory(children),
                 Err(_) => PreviewContext::DirectoryUnavailable,
             },
-            EntryKind::File => PreviewContext::File,
+            EntryKind::File => PreviewContext::File(FilePreview::build(entry.path())),
             EntryKind::Symlink => PreviewContext::Symlink,
             EntryKind::Other => PreviewContext::Other,
         }
@@ -241,14 +242,34 @@ mod tests {
     }
 
     #[test]
-    fn preview_of_a_regular_file_does_not_read_it_and_is_not_a_directory_listing() {
+    fn preview_of_a_regular_utf8_file_shows_its_content() {
         let dir = TempDir::new();
         fs::write(dir.path().join("file.txt"), b"content").unwrap();
         let file = FileEntry::from_path(dir.path().join("file.txt")).unwrap();
 
         let preview = PreviewContext::build(Some(&file), false);
 
-        assert!(matches!(preview, PreviewContext::File));
+        match preview {
+            PreviewContext::File(FilePreview::Text { content, truncated }) => {
+                assert_eq!(content, "content");
+                assert!(!truncated);
+            }
+            other => panic!("expected a Text file preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_of_a_binary_file_is_unsupported_not_a_directory_listing() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("file.bin"), [b'a', 0u8, b'b']).unwrap();
+        let file = FileEntry::from_path(dir.path().join("file.bin")).unwrap();
+
+        let preview = PreviewContext::build(Some(&file), false);
+
+        assert!(matches!(
+            preview,
+            PreviewContext::File(FilePreview::Unsupported)
+        ));
     }
 
     #[cfg(unix)]
@@ -267,6 +288,39 @@ mod tests {
         let preview = PreviewContext::build(Some(&link_entry), false);
 
         assert!(matches!(preview, PreviewContext::Symlink));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_of_a_symlink_to_a_text_file_stays_symlink_never_reads_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new();
+        let real = dir.path().join("real.txt");
+        let link = dir.path().join("text-link");
+        fs::write(&real, "not shown").unwrap();
+        symlink(&real, &link).unwrap();
+        let link_entry = FileEntry::from_path(link).unwrap();
+
+        let preview = PreviewContext::build(Some(&link_entry), false);
+
+        assert!(matches!(preview, PreviewContext::Symlink));
+    }
+
+    #[test]
+    fn preview_of_a_file_removed_after_being_selected_is_unavailable_not_a_crash() {
+        let dir = TempDir::new();
+        let path = dir.path().join("ghost.txt");
+        fs::write(&path, "gone soon").unwrap();
+        let entry = FileEntry::from_path(path.clone()).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let preview = PreviewContext::build(Some(&entry), false);
+
+        assert!(matches!(
+            preview,
+            PreviewContext::File(FilePreview::Unavailable)
+        ));
     }
 
     #[test]

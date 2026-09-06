@@ -44,15 +44,21 @@ export component MainWindow inherits Window {
     in property <[ContextRow]> parent-entries;
 
     // PREVIEW: read-only context for whatever is selected in CURRENT.
-    // `preview-mode` picks which of the two views below to show; it's a
-    // tag Rust computes from `PreviewContext` (never something `.slint`
-    // derives from file kind itself — see `ui/window.rs`). "directory"
-    // shows `preview-entries`; every other mode ("none", "file", "symlink",
-    // "other", "unavailable") shows `preview-label`, a plain contextual
-    // message — never file content, MIME, or a thumbnail (Milestone 4).
+    // `preview-mode` picks which of the views below to show; it's a tag
+    // Rust computes from `PreviewContext`/`FilePreview` (never something
+    // `.slint` derives from file kind itself — see `ui/window.rs`). Both
+    // "directory" and "text" render `preview-entries` through the same
+    // per-row `ListView` below: `.slint` receives an already-validated-
+    // UTF-8, already-row-split list (see `ui/window.rs::preview_text_rows`)
+    // and does no filesystem I/O, truncation, or line-splitting of its
+    // own. "text" additionally shows `preview-truncated`. Every other mode
+    // ("none", "empty", "unsupported", "unavailable", "symlink", "other")
+    // shows `preview-label`, a plain contextual message. Never a MIME type
+    // or a thumbnail — out of scope for Milestone 4A.
     in property <string> preview-mode: "none";
     in property <[ContextRow]> preview-entries;
     in property <string> preview-label: "";
+    in property <bool> preview-truncated: false;
 
     // UI never touches the filesystem or Navigation, and never decides
     // what a keystroke or click *means* — it only reports what happened.
@@ -262,6 +268,14 @@ export component MainWindow inherits Window {
                             vertical-alignment: center;
                         }
                     }
+                    // Directory listings: unchanged from Milestone 3 — a
+                    // read-only `ListView` (not `StandardListView` — no
+                    // focus, no click-to-select, so it can never steal
+                    // `j`/`k`/`h`/`l`/Enter/`.` from CURRENT's
+                    // `focus-scope`), fixed-height, unwrapped rows. Kept as
+                    // its own delegate, separate from "text" below, so
+                    // fixing the text-row layout (Bug 2) can't change
+                    // directory preview's visual behavior at all.
                     if root.preview-mode == "directory": ListView {
                         for row[i] in root.preview-entries: Rectangle {
                             height: 22px;
@@ -273,7 +287,51 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    if root.preview-mode != "directory": Rectangle {
+                    // Text content: `preview-entries` is already split into
+                    // short rows by `ui/window.rs::preview_text_rows`
+                    // (never one big multi-line `Text` element — Slint
+                    // 1.17.1's `renderer-software` glyph-run drawing panics,
+                    // `euclid` `Option::unwrap()` on `None`, on a single
+                    // `Text` holding either very many lines or one very
+                    // long unbroken run, reproduced via this milestone's
+                    // own smoke testing). Unlike directory rows, each one
+                    // here still needs to *wrap* (a 200-character chunk is
+                    // reliably wider than PREVIEW) and reflow on resize:
+                    // `width` is bound to the row's own real width from the
+                    // layout (never a guessed character count — i3 can
+                    // resize this pane at any time), and each row's
+                    // `height` follows its `Text`'s `preferred-height` at
+                    // that width — Slint's documented height-for-width
+                    // behavior for a wrapped `Text` — instead of a fixed
+                    // 22px that would clip wrapped lines.
+                    if root.preview-mode == "text": VerticalLayout {
+                        ListView {
+                            for row[i] in root.preview-entries: Rectangle {
+                                width: parent.width;
+                                height: row-text.preferred-height + 4px;
+                                row-text := Text {
+                                    text: row.text;
+                                    color: #a6adc8;
+                                    x: 8px;
+                                    y: 2px;
+                                    width: parent.width - 16px;
+                                    wrap: char-wrap;
+                                    font-size: 12px;
+                                }
+                            }
+                        }
+                        if root.preview-truncated: Rectangle {
+                            height: 18px;
+                            Text {
+                                text: "(truncated)";
+                                color: #6c7086;
+                                x: 8px;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    if root.preview-mode != "directory" && root.preview-mode != "text": Rectangle {
                         Text {
                             text: root.preview-label;
                             color: #a6adc8;

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
-use crate::app::{Action, AppState, PreviewContext};
+use crate::app::{Action, AppState, FilePreview, PreviewContext};
 use crate::model::{EntryKind, FileEntry};
 use crate::ui::input::{self, KeyStroke};
 
@@ -264,33 +264,102 @@ fn refresh_parent(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     ui.set_parent_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
+/// Upper bound, in `char`s, on how much text any single `.slint` `Text`
+/// element in PREVIEW is ever asked to lay out at once. Not a content or
+/// truncation rule (`core::filesystem::MAX_TEXT_PREVIEW_BYTES` is; this
+/// constant never affects what bytes are read or what counts as
+/// `truncated`) — a pure rendering-safety measure: Slint 1.17.1's
+/// `renderer-software` glyph-run drawing (`i_slint_core::textlayout::
+/// sharedparley`, backed by Parley) was found, via this milestone's own
+/// smoke testing, to panic (`euclid::vector.rs` `Option::unwrap()` on
+/// `None`) when a *single* `Text` element is handed either very many
+/// wrapped/newline-delimited lines (reproduced with a 1567-line, ~70KB
+/// plain-text file) or one very long unbroken run of characters
+/// (reproduced with a 65535-character line). Neither `word-wrap` vs.
+/// `char-wrap` nor content shape mattered — only shrinking what any one
+/// `Text` element has to lay out did. So PREVIEW content is split into
+/// short rows (see [`preview_text_rows`]) and rendered through the same
+/// per-row `ListView` already used for PARENT and directory previews —
+/// architecture hundreds of directory entries already exercise safely,
+/// rather than a new mechanism.
+const PREVIEW_ROW_CHUNK_CHARS: usize = 200;
+
+/// Splits `content` into short, render-safe rows: first on `\n` (so real
+/// line breaks are preserved), then further on
+/// [`PREVIEW_ROW_CHUNK_CHARS`] so no single row — and so no single
+/// `.slint` `Text` element — ever has to lay out an unbounded run of
+/// characters. `highlighted` is always `false`; these rows have no
+/// PARENT-style "current" entry to mark.
+fn preview_text_rows(content: &str) -> Vec<ContextRow> {
+    let mut rows = Vec::new();
+    for line in content.split('\n') {
+        if line.is_empty() {
+            rows.push(ContextRow {
+                text: String::new().into(),
+                highlighted: false,
+            });
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        for chunk in chars.chunks(PREVIEW_ROW_CHUNK_CHARS) {
+            rows.push(ContextRow {
+                text: chunk.iter().collect::<String>().into(),
+                highlighted: false,
+            });
+        }
+    }
+    rows
+}
+
 fn refresh_preview(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
-    let (mode, rows, label) = {
+    let (mode, rows, label, truncated) = {
         let st = state.borrow();
         match st.preview() {
-            PreviewContext::None => ("none", Vec::new(), String::new()),
-            PreviewContext::Directory(children) => {
-                ("directory", context_rows(children, None), String::new())
-            }
+            PreviewContext::None => ("none", Vec::new(), String::new(), false),
+            PreviewContext::Directory(children) => (
+                "directory",
+                context_rows(children, None),
+                String::new(),
+                false,
+            ),
             PreviewContext::DirectoryUnavailable => (
                 "unavailable",
                 Vec::new(),
                 preview_label(&st, "Directory", "Unavailable"),
+                false,
             ),
-            PreviewContext::File => (
-                "file",
+            PreviewContext::File(FilePreview::Text { content, .. }) if content.is_empty() => {
+                ("empty", Vec::new(), "(empty file)".to_string(), false)
+            }
+            PreviewContext::File(FilePreview::Text { content, truncated }) => (
+                "text",
+                preview_text_rows(content),
+                String::new(),
+                *truncated,
+            ),
+            PreviewContext::File(FilePreview::Unsupported) => (
+                "unsupported",
                 Vec::new(),
-                preview_label(&st, "Regular file", "Preview not implemented yet"),
+                preview_label(&st, "Regular file", "Preview not available"),
+                false,
+            ),
+            PreviewContext::File(FilePreview::Unavailable) => (
+                "unavailable",
+                Vec::new(),
+                preview_label(&st, "Regular file", "Unavailable"),
+                false,
             ),
             PreviewContext::Symlink => (
                 "symlink",
                 Vec::new(),
                 preview_label(&st, "Symlink", "Preview not implemented yet"),
+                false,
             ),
             PreviewContext::Other => (
                 "other",
                 Vec::new(),
                 preview_label(&st, "Other", "Preview not implemented yet"),
+                false,
             ),
         }
         // `st` is dropped here, before any `ui.set_*` call.
@@ -298,6 +367,7 @@ fn refresh_preview(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     ui.set_preview_mode(mode.into());
     ui.set_preview_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
     ui.set_preview_label(label.into());
+    ui.set_preview_truncated(truncated);
 }
 
 /// Builds a PREVIEW placeholder message for a non-directory (or unreadable-
@@ -359,5 +429,70 @@ mod tests {
         assert_eq!(clicks.register(4, true), ClickOutcome::Select);
         assert_eq!(clicks.register(4, false), ClickOutcome::Select);
         assert_eq!(clicks.register(4, true), ClickOutcome::Activate);
+    }
+
+    fn row_texts(rows: &[ContextRow]) -> Vec<String> {
+        rows.iter().map(|r| r.text.to_string()).collect()
+    }
+
+    #[test]
+    fn preview_text_rows_splits_on_real_newlines() {
+        let rows = preview_text_rows("first\nsecond\nthird");
+
+        assert_eq!(row_texts(&rows), vec!["first", "second", "third"]);
+        assert!(rows.iter().all(|r| !r.highlighted));
+    }
+
+    #[test]
+    fn preview_text_rows_chunks_a_single_unbroken_line_to_the_row_limit() {
+        // The exact shape that crashed Slint 1.17.1's software-renderer
+        // glyph-run drawing before this fix: one line, far longer than
+        // `PREVIEW_ROW_CHUNK_CHARS`, with no whitespace to break on.
+        let content = "a".repeat(PREVIEW_ROW_CHUNK_CHARS * 3 + 7);
+
+        let rows = preview_text_rows(&content);
+
+        assert_eq!(rows.len(), 4);
+        for row in &rows[..3] {
+            assert_eq!(row.text.len(), PREVIEW_ROW_CHUNK_CHARS);
+        }
+        assert_eq!(rows[3].text.len(), 7);
+        assert_eq!(
+            rows.iter().map(|r| r.text.len()).sum::<usize>(),
+            content.len()
+        );
+    }
+
+    #[test]
+    fn preview_text_rows_never_splits_a_multibyte_character_mid_codepoint() {
+        // Chunking by `char`, not by byte, so a row boundary can never
+        // land inside a multibyte UTF-8 sequence.
+        let content = "é".repeat(PREVIEW_ROW_CHUNK_CHARS + 1);
+
+        let rows = preview_text_rows(&content);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text.chars().count(), PREVIEW_ROW_CHUNK_CHARS);
+        assert_eq!(rows[1].text.chars().count(), 1);
+        // Every row is itself valid UTF-8 by construction (it's a `String`);
+        // this just confirms no character was truncated in the process.
+        assert!(rows.iter().all(|r| r.text.chars().all(|c| c == 'é')));
+    }
+
+    #[test]
+    fn preview_text_rows_of_empty_content_is_a_single_empty_row() {
+        // Real callers special-case an empty file before reaching this
+        // function (see `refresh_preview`'s "empty" mode); this documents
+        // what the function itself does, in isolation, for that input.
+        let rows = preview_text_rows("");
+
+        assert_eq!(row_texts(&rows), vec![""]);
+    }
+
+    #[test]
+    fn preview_text_rows_preserves_blank_lines() {
+        let rows = preview_text_rows("a\n\nb");
+
+        assert_eq!(row_texts(&rows), vec!["a", "", "b"]);
     }
 }
