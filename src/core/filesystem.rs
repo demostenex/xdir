@@ -21,13 +21,22 @@ pub fn read_directory(path: &Path, show_hidden: bool) -> io::Result<Vec<FileEntr
         entries.push(file_entry);
     }
 
+    sort_entries(&mut entries);
+
+    Ok(entries)
+}
+
+/// Sorts `entries` the same way [`read_directory`] always has: directories
+/// before everything else, then deterministically by name within each
+/// group. Exposed so a caller that builds a `FileEntry` list outside a
+/// single `read_directory` call (e.g. splicing in one synthesized entry)
+/// can keep the exact same ordering instead of re-deriving it.
+pub(crate) fn sort_entries(entries: &mut [FileEntry]) {
     entries.sort_by(|a, b| {
         sort_group(a.kind())
             .cmp(&sort_group(b.kind()))
             .then_with(|| a.name().cmp(b.name()))
     });
-
-    Ok(entries)
 }
 
 fn sort_group(kind: EntryKind) -> u8 {

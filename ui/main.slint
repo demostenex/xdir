@@ -1,4 +1,15 @@
-import { StandardListView } from "std-widgets.slint";
+import { StandardListView, ListView } from "std-widgets.slint";
+
+// A single row in the PARENT or PREVIEW-of-directory listings. Both are
+// read-only projections built entirely in Rust (`ui/window.rs`): `text` is
+// already the final display label (a trailing "/" for directories is added
+// there, not here — `.slint` never inspects `EntryKind`), and `highlighted`
+// marks PARENT's row for `current_dir`, identified by Rust via real `Path`
+// equality, never by comparing this text.
+struct ContextRow {
+    text: string,
+    highlighted: bool,
+}
 
 export component MainWindow inherits Window {
     title: "xdir";
@@ -8,7 +19,9 @@ export component MainWindow inherits Window {
     // min-width == max-width == width), which made i3 treat this window as
     // non-resizable in tiling. A normal, cooperative X11 window must leave
     // the window manager as the authority over its actual geometry.
-    preferred-width: 640px;
+    // Widened for Milestone 3's three-pane layout (was 640px for the
+    // single-pane 1B/2 UI); still just an initial hint, not a constraint.
+    preferred-width: 960px;
     preferred-height: 420px;
     background: #1e1e2e;
     // xdir's standard typeface. Centralized here (not repeated per Text/
@@ -21,6 +34,25 @@ export component MainWindow inherits Window {
     in property <string> path-text: "";
     in property <string> status-text: "0 items";
     in property <[StandardListViewItem]> entries;
+
+    // PARENT: read-only context, never navigable. `has-parent` is an
+    // explicit signal from Rust (current_dir().parent() being None at
+    // root) rather than something `.slint` infers from `parent-entries`
+    // being empty, which could also happen if the parent just failed to
+    // read.
+    in property <bool> has-parent: false;
+    in property <[ContextRow]> parent-entries;
+
+    // PREVIEW: read-only context for whatever is selected in CURRENT.
+    // `preview-mode` picks which of the two views below to show; it's a
+    // tag Rust computes from `PreviewContext` (never something `.slint`
+    // derives from file kind itself — see `ui/window.rs`). "directory"
+    // shows `preview-entries`; every other mode ("none", "file", "symlink",
+    // "other", "unavailable") shows `preview-label`, a plain contextual
+    // message — never file content, MIME, or a thumbnail (Milestone 4).
+    in property <string> preview-mode: "none";
+    in property <[ContextRow]> preview-entries;
+    in property <string> preview-label: "";
 
     // UI never touches the filesystem or Navigation, and never decides
     // what a keystroke or click *means* — it only reports what happened.
@@ -77,51 +109,178 @@ export component MainWindow inherits Window {
             background: #313244;
         }
 
-        Rectangle {
-            focus-scope := FocusScope {
-                width: 100%;
-                height: 100%;
-
-                // This handler *identifies* the key (including recognizing
-                // the arrows via Slint's own `Key.*Arrow` constants, which
-                // nothing outside Slint can do) and reports raw modifier
-                // flags — it does not decide what any combination means
-                // for xdir. That decision, and whether the event should be
-                // consumed, comes back from `root.key-input(...)`.
-                key-pressed(event) => {
-                    if (event.text == Key.UpArrow) {
-                        if (root.key-input("Up", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
-                    } else if (event.text == Key.DownArrow) {
-                        if (root.key-input("Down", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
-                    } else if (event.text == Key.LeftArrow) {
-                        if (root.key-input("Left", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
-                    } else if (event.text == Key.RightArrow) {
-                        if (root.key-input("Right", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
-                    } else if (root.key-input(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) {
-                        accept
-                    } else {
-                        reject
+        HorizontalLayout {
+            // PARENT — context only. A plain `ListView` (not
+            // `StandardListView`): it has no `FocusScope` and no
+            // click-to-select of its own (confirmed by reading Slint's own
+            // `widgets/common/listview.slint` — only `StandardListView`
+            // adds the `i-focus-scope`/`TouchArea` that make a row
+            // selectable and focusable), so it can never steal keyboard
+            // focus from CURRENT or turn a click into a selection/
+            // navigation, with no extra "read-only" wrapping needed.
+            Rectangle {
+                horizontal-stretch: 25;
+                background: #1e1e2e;
+                VerticalLayout {
+                    Rectangle {
+                        height: 20px;
+                        background: #181825;
+                        Text {
+                            text: "PARENT";
+                            color: #6c7086;
+                            font-size: 11px;
+                            x: 8px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if root.has-parent: ListView {
+                        for row[i] in root.parent-entries: Rectangle {
+                            height: 22px;
+                            background: row.highlighted ? #313244 : transparent;
+                            Text {
+                                text: row.text;
+                                color: row.highlighted ? #cdd6f4 : #a6adc8;
+                                x: 8px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    if !root.has-parent: Rectangle {
+                        Text {
+                            text: "(no parent)";
+                            color: #6c7086;
+                            x: 8px;
+                            y: 6px;
+                            font-size: 12px;
+                        }
                     }
                 }
+            }
 
-                current-list := StandardListView {
-                    width: 100%;
-                    height: 100%;
-                    model: root.entries;
+            Rectangle {
+                width: 1px;
+                horizontal-stretch: 0;
+                background: #313244;
+            }
 
-                    // Fires only when the built-in click handling actually
-                    // changed the selection (it no-ops on a repeat click of
-                    // the already-selected row) — used purely to mirror the
-                    // resulting selection into AppState.
-                    current-item-changed(index) => { root.selection-changed(index); }
+            // CURRENT — the only operational pane: keyboard, selection,
+            // click and double-click all continue to work exactly as in
+            // Milestone 2.
+            Rectangle {
+                horizontal-stretch: 45;
+                VerticalLayout {
+                    Rectangle {
+                        height: 20px;
+                        background: #181825;
+                        Text {
+                            text: "CURRENT";
+                            color: #89b4fa;
+                            font-size: 11px;
+                            x: 8px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {
+                        focus-scope := FocusScope {
+                            width: 100%;
+                            height: 100%;
 
-                    // Fires on every mouse press on a row regardless of
-                    // whether the selection changed, which is what a repeat
-                    // click needs — used only for double-click timing on
-                    // the Rust side.
-                    item-pointer-event(index, event, position) => {
-                        if (event.kind == PointerEventKind.down) {
-                            root.item-pressed(index, event.button == PointerEventButton.left);
+                            // This handler *identifies* the key (including
+                            // recognizing the arrows via Slint's own
+                            // `Key.*Arrow` constants, which nothing outside
+                            // Slint can do) and reports raw modifier flags —
+                            // it does not decide what any combination means
+                            // for xdir. That decision, and whether the event
+                            // should be consumed, comes back from
+                            // `root.key-input(...)`.
+                            key-pressed(event) => {
+                                if (event.text == Key.UpArrow) {
+                                    if (root.key-input("Up", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                                } else if (event.text == Key.DownArrow) {
+                                    if (root.key-input("Down", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                                } else if (event.text == Key.LeftArrow) {
+                                    if (root.key-input("Left", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                                } else if (event.text == Key.RightArrow) {
+                                    if (root.key-input("Right", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                                } else if (root.key-input(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) {
+                                    accept
+                                } else {
+                                    reject
+                                }
+                            }
+
+                            current-list := StandardListView {
+                                width: 100%;
+                                height: 100%;
+                                model: root.entries;
+
+                                // Fires only when the built-in click handling
+                                // actually changed the selection (it no-ops
+                                // on a repeat click of the already-selected
+                                // row) — used purely to mirror the resulting
+                                // selection into AppState.
+                                current-item-changed(index) => { root.selection-changed(index); }
+
+                                // Fires on every mouse press on a row
+                                // regardless of whether the selection
+                                // changed, which is what a repeat click
+                                // needs — used only for double-click timing
+                                // on the Rust side.
+                                item-pointer-event(index, event, position) => {
+                                    if (event.kind == PointerEventKind.down) {
+                                        root.item-pressed(index, event.button == PointerEventButton.left);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 1px;
+                horizontal-stretch: 0;
+                background: #313244;
+            }
+
+            // PREVIEW — context only, same non-interactive `ListView`
+            // approach as PARENT when showing a directory's children; every
+            // other mode shows a plain contextual message instead, never
+            // file content.
+            Rectangle {
+                horizontal-stretch: 30;
+                background: #1e1e2e;
+                VerticalLayout {
+                    Rectangle {
+                        height: 20px;
+                        background: #181825;
+                        Text {
+                            text: "PREVIEW";
+                            color: #6c7086;
+                            font-size: 11px;
+                            x: 8px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if root.preview-mode == "directory": ListView {
+                        for row[i] in root.preview-entries: Rectangle {
+                            height: 22px;
+                            Text {
+                                text: row.text;
+                                color: #a6adc8;
+                                x: 8px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    if root.preview-mode != "directory": Rectangle {
+                        Text {
+                            text: root.preview-label;
+                            color: #a6adc8;
+                            x: 8px;
+                            y: 8px;
+                            font-size: 12px;
+                            wrap: word-wrap;
                         }
                     }
                 }

@@ -1,8 +1,48 @@
 use std::path::Path;
 
-use crate::app::Action;
+use crate::app::{Action, ParentContext, PreviewContext};
 use crate::core::navigation::Navigation;
 use crate::model::FileEntry;
+
+/// What a `dispatch` call actually changed, so the UI layer never has to
+/// infer that by diffing entry counts or any other derived signal —
+/// exactly that approach missed a real bug in Milestone 2 (`ToggleHidden`
+/// changed the listing without changing `current_dir`), and a
+/// same-length-different-content listing would slip past a length-only
+/// check just as easily. `AppState` knows precisely which contexts it
+/// recomputed on each action, so it just reports that directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Update {
+    pub current_changed: bool,
+    pub parent_changed: bool,
+    pub preview_changed: bool,
+}
+
+impl Update {
+    const NONE: Update = Update {
+        current_changed: false,
+        parent_changed: false,
+        preview_changed: false,
+    };
+    const ALL: Update = Update {
+        current_changed: true,
+        parent_changed: true,
+        preview_changed: true,
+    };
+    const PREVIEW_ONLY: Update = Update {
+        current_changed: false,
+        parent_changed: false,
+        preview_changed: true,
+    };
+
+    fn or(self, other: Update) -> Update {
+        Update {
+            current_changed: self.current_changed || other.current_changed,
+            parent_changed: self.parent_changed || other.parent_changed,
+            preview_changed: self.preview_changed || other.preview_changed,
+        }
+    }
+}
 
 /// Toolkit-agnostic application state. This is the source of truth; any UI
 /// model (a Slint `ModelRc`, or anything else) is only a projection of it.
@@ -10,16 +50,25 @@ pub struct AppState {
     navigation: Navigation,
     entries: Vec<FileEntry>,
     selected: Option<usize>,
+    parent: ParentContext,
+    preview: PreviewContext,
 }
 
 impl AppState {
     pub fn new(navigation: Navigation) -> Self {
         let entries = navigation.entries().unwrap_or_default();
         let selected = initial_selection(&entries);
+        let parent = ParentContext::build(navigation.current_dir(), navigation.show_hidden());
+        let preview = PreviewContext::build(
+            selected.and_then(|i| entries.get(i)),
+            navigation.show_hidden(),
+        );
         AppState {
             navigation,
             entries,
             selected,
+            parent,
+            preview,
         }
     }
 
@@ -43,61 +92,111 @@ impl AppState {
         self.navigation.show_hidden()
     }
 
-    /// Applies `action`, the only way any part of this state changes.
-    pub fn dispatch(&mut self, action: Action) {
+    pub fn parent(&self) -> &ParentContext {
+        &self.parent
+    }
+
+    pub fn preview(&self) -> &PreviewContext {
+        &self.preview
+    }
+
+    /// Applies `action`, the only way any part of this state changes, and
+    /// reports which of CURRENT/PARENT/PREVIEW actually changed.
+    pub fn dispatch(&mut self, action: Action) -> Update {
         match action {
             Action::SelectNext => self.select_by(1),
             Action::SelectPrevious => self.select_by(-1),
             Action::SelectIndex(index) => self.select_index(index),
             Action::ActivateSelected => self.activate_selected(),
             Action::ActivateIndex(index) => {
-                self.select_index(index);
-                self.activate_selected();
+                if index >= self.entries.len() {
+                    // A no-op `select_index` still leaves `self.selected`
+                    // pointing at whatever was selected before — and
+                    // `activate_selected` acts on `self.selected`, not on
+                    // `index`. Without this check, an out-of-range index
+                    // would silently activate the *previous* selection
+                    // instead of doing nothing.
+                    Update::NONE
+                } else {
+                    let selected = self.select_index(index);
+                    let activated = self.activate_selected();
+                    selected.or(activated)
+                }
             }
             Action::GoParent => self.go_parent(),
             Action::ToggleHidden => self.toggle_hidden(),
         }
     }
 
-    fn select_by(&mut self, delta: i32) {
+    /// Clamped move by `delta`. A no-op when it doesn't actually change the
+    /// selection (e.g. already on the last entry and moving further down)
+    /// reports `Update::NONE` rather than `PREVIEW_ONLY`: nothing changed,
+    /// so nothing should be re-read.
+    fn select_by(&mut self, delta: i32) -> Update {
         if self.entries.is_empty() {
-            return;
+            return Update::NONE;
         }
         let last = self.entries.len() as i32 - 1;
         let current = self.selected.map(|i| i as i32).unwrap_or(-1);
-        self.selected = Some((current + delta).clamp(0, last) as usize);
+        let next = (current + delta).clamp(0, last) as usize;
+        if self.selected == Some(next) {
+            return Update::NONE;
+        }
+        self.selected = Some(next);
+        self.refresh_preview();
+        Update::PREVIEW_ONLY
     }
 
-    fn select_index(&mut self, index: usize) {
-        if index < self.entries.len() {
-            self.selected = Some(index);
+    /// Selects `index` directly. A no-op both for an out-of-range index and
+    /// for re-selecting the entry that's already selected — the latter
+    /// matters because the UI layer's own selection-sync (`sync_selection`)
+    /// round-trips through Slint's `current-item-changed` back into this
+    /// same call with the index it was just told to set; without this
+    /// check that round-trip would rebuild PREVIEW a second time for
+    /// nothing.
+    fn select_index(&mut self, index: usize) -> Update {
+        if index >= self.entries.len() {
+            return Update::NONE;
         }
+        if self.selected == Some(index) {
+            return Update::NONE;
+        }
+        self.selected = Some(index);
+        self.refresh_preview();
+        Update::PREVIEW_ONLY
     }
 
     /// Activates the selected entry. Only directories (or symlinks that
     /// resolve to one) cause navigation; activating a regular file is a
     /// deliberate no-op in this milestone (openers arrive later).
-    fn activate_selected(&mut self) {
+    fn activate_selected(&mut self) -> Update {
         let Some(target) = self
             .selected_entry()
             .map(|entry| entry.path().to_path_buf())
         else {
-            return;
+            return Update::NONE;
         };
         if self.navigation.navigate_to(&target).is_ok() {
             self.reload();
+            Update::ALL
+        } else {
+            Update::NONE
         }
     }
 
-    fn go_parent(&mut self) {
+    fn go_parent(&mut self) -> Update {
         if self.navigation.go_to_parent().is_ok() {
             self.reload();
+            Update::ALL
+        } else {
+            Update::NONE
         }
     }
 
     fn reload(&mut self) {
         self.entries = self.navigation.entries().unwrap_or_default();
         self.selected = initial_selection(&self.entries);
+        self.refresh_contexts();
     }
 
     /// Flips `show_hidden` and reloads the current directory. Unlike
@@ -108,7 +207,7 @@ impl AppState {
     /// to the first entry only if the previously selected one is no longer
     /// listed (e.g. a dotfile that just got hidden again), or to no
     /// selection if the directory is now empty.
-    fn toggle_hidden(&mut self) {
+    fn toggle_hidden(&mut self) -> Update {
         let selected_path = self
             .selected_entry()
             .map(|entry| entry.path().to_path_buf());
@@ -124,6 +223,25 @@ impl AppState {
                     .position(|entry| entry.path() == path.as_path())
             })
             .or_else(|| initial_selection(&self.entries));
+
+        self.refresh_contexts();
+        Update::ALL
+    }
+
+    /// Rebuilds both PARENT and PREVIEW. Used whenever `current_dir` or
+    /// `show_hidden` changed — anything that could move PARENT's target
+    /// necessarily also invalidates PREVIEW, since PREVIEW's target
+    /// (`selected_entry`) is itself relative to `current_dir`.
+    fn refresh_contexts(&mut self) {
+        self.parent =
+            ParentContext::build(self.navigation.current_dir(), self.navigation.show_hidden());
+        self.refresh_preview();
+    }
+
+    /// Rebuilds only PREVIEW. Used on a plain selection move, so a `j`/`k`
+    /// press never re-reads PARENT's listing for no reason.
+    fn refresh_preview(&mut self) {
+        self.preview = PreviewContext::build(self.selected_entry(), self.navigation.show_hidden());
     }
 }
 
@@ -332,5 +450,165 @@ mod tests {
 
         state.dispatch(Action::ToggleHidden);
         assert_eq!(state.selected(), None);
+    }
+
+    #[test]
+    fn moving_selection_updates_preview_but_not_parent() {
+        let dir = TempDir::new();
+        fs::create_dir(dir.path().join("a_dir")).unwrap();
+        fs::create_dir(dir.path().join("b_dir")).unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(names(&state), vec!["a_dir", "b_dir"]);
+        let parent_before = state.parent().entries().len();
+
+        let update = state.dispatch(Action::SelectNext);
+
+        assert_eq!(
+            update,
+            Update {
+                current_changed: false,
+                parent_changed: false,
+                preview_changed: true,
+            }
+        );
+        assert_eq!(state.parent().entries().len(), parent_before);
+        match state.preview() {
+            PreviewContext::Directory(children) => assert!(children.is_empty()),
+            other => panic!("expected an (empty) Directory preview for b_dir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entering_a_directory_updates_current_parent_and_preview() {
+        let dir = TempDir::new();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::create_dir(sub.join("inner")).unwrap();
+        fs::create_dir(sub.join("inner").join("leaf")).unwrap();
+        // Sorts after "sub" (dirs-first, then alphabetical), so "sub"
+        // stays the initial selection at index 0.
+        fs::create_dir(dir.path().join("zzz_sibling")).unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let update = state.dispatch(Action::ActivateSelected);
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), sub);
+        assert_eq!(state.parent().dir(), Some(dir.path()));
+        let highlighted = state
+            .parent()
+            .current_index()
+            .and_then(|i| state.parent().entries().get(i));
+        assert_eq!(highlighted.map(FileEntry::path), Some(sub.as_path()));
+        // Entering "sub" resets the selection to its first entry, "inner";
+        // PREVIEW must reflect *that* entry's own children ("leaf"), not
+        // "sub"'s.
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("inner"))
+        );
+        match state.preview() {
+            PreviewContext::Directory(children) => {
+                assert_eq!(
+                    children.iter().map(|e| e.name().to_owned()).next(),
+                    Some(std::ffi::OsString::from("leaf"))
+                );
+            }
+            other => panic!("expected Directory preview for the selected entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_hidden_updates_current_parent_and_preview() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".hidden"), b"").unwrap();
+        fs::create_dir(dir.path().join("visible_dir")).unwrap();
+        fs::write(dir.path().join("visible_dir/.child_hidden"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let update = state.dispatch(Action::ToggleHidden);
+
+        assert_eq!(update, Update::ALL);
+        assert!(state.show_hidden());
+        match state.preview() {
+            PreviewContext::Directory(children) => {
+                let child_names: Vec<String> = children
+                    .iter()
+                    .map(|e| e.name().to_string_lossy().into_owned())
+                    .collect();
+                assert!(child_names.contains(&".child_hidden".to_string()));
+            }
+            other => panic!("expected Directory preview for visible_dir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_no_op_action_reports_no_update() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        // "a.txt" is a regular file: ActivateSelected is a deliberate no-op.
+        let update = state.dispatch(Action::ActivateSelected);
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn select_next_at_the_last_entry_is_a_no_op_update() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("a.txt"), b"").unwrap();
+        fs::write(dir.path().join("b.txt"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SelectNext); // now on "b.txt", the last entry
+        assert_eq!(state.selected(), Some(1));
+
+        let update = state.dispatch(Action::SelectNext);
+
+        assert_eq!(state.selected(), Some(1));
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn select_previous_at_the_first_entry_is_a_no_op_update() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("a.txt"), b"").unwrap();
+        fs::write(dir.path().join("b.txt"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(state.selected(), Some(0)); // already on "a.txt", the first entry
+
+        let update = state.dispatch(Action::SelectPrevious);
+
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn select_index_of_the_already_selected_entry_is_a_no_op_update() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(state.selected(), Some(0));
+
+        let update = state.dispatch(Action::SelectIndex(0));
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn activate_index_out_of_range_is_a_complete_no_op() {
+        let dir = TempDir::new();
+        fs::create_dir(dir.path().join("directory")).unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        // "directory" is selected (the only entry).
+        assert_eq!(state.selected(), Some(0));
+
+        let update = state.dispatch(Action::ActivateIndex(999));
+
+        // An out-of-range ActivateIndex must not fall back to activating
+        // whatever was already selected.
+        assert_eq!(update, Update::NONE);
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.current_dir(), dir.path());
     }
 }

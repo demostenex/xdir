@@ -76,4 +76,31 @@ impl FileEntry {
             self.name.to_string_lossy().starts_with('.')
         }
     }
+
+    /// Builds a `FileEntry` for `path` directly, without it coming from a
+    /// directory listing. Used only so the PARENT pane can keep
+    /// representing `current_dir` even when it's a dotfile that its own
+    /// `show_hidden`-filtered parent listing would otherwise omit. Uses
+    /// `symlink_metadata` (never follows `path` itself), matching
+    /// `from_dir_entry`'s classification so a symlinked directory is still
+    /// `Symlink`, never `Directory`.
+    pub(crate) fn from_path(path: PathBuf) -> io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let name = path
+            .file_name()
+            .map(OsStr::to_os_string)
+            .unwrap_or_default();
+
+        let kind = if metadata.is_symlink() {
+            EntryKind::Symlink
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else if metadata.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Other
+        };
+
+        Ok(FileEntry { path, name, kind })
+    }
 }

@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
-use crate::app::{Action, AppState};
+use crate::app::{Action, AppState, PreviewContext};
+use crate::model::{EntryKind, FileEntry};
 use crate::ui::input::{self, KeyStroke};
 
 slint::include_modules!();
@@ -73,7 +74,9 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     let state = Rc::new(RefCell::new(state));
     let clicks = Rc::new(RefCell::new(ClickTracker::new(DOUBLE_CLICK_WINDOW)));
 
-    full_refresh(&state, &ui);
+    full_refresh_current(&state, &ui);
+    refresh_parent(&state, &ui);
+    refresh_preview(&state, &ui);
     ui.invoke_focus_list();
 
     // `.slint` only names the physical key (a literal character, or one
@@ -103,14 +106,20 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
 
     // StandardListView's own click handling (built-in, and already
     // left-button-only) moved the selection and scrolled it into view
-    // before this fires; we only need to mirror that into AppState.
+    // before this fires; this mirrors that into AppState through the same
+    // `apply` every other input goes through — a plain `dispatch` here
+    // (as before Milestone 3's PREVIEW pane) updated `AppState` correctly
+    // but never told `ui` to redraw PREVIEW, since only `apply` calls
+    // `refresh_preview`. `select_index`'s no-op-on-unchanged-index guard
+    // (see its doc comment) keeps this safe even though Slint's own
+    // `current-item-changed` already reflects the click.
     ui.on_selection_changed({
         let state = state.clone();
+        let ui = ui.as_weak();
         move |index| {
             if index >= 0 {
-                state
-                    .borrow_mut()
-                    .dispatch(Action::SelectIndex(index as usize));
+                let ui = ui.unwrap();
+                apply(&state, &ui, Action::SelectIndex(index as usize));
             }
         }
     });
@@ -140,52 +149,54 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     ui.run()
 }
 
-/// Runs `action` through `AppState` and syncs the UI: a full rebuild if the
-/// directory or the entry list itself changed, or just the selection
-/// otherwise.
+/// Runs `action` through `AppState` and syncs whichever of CURRENT/PARENT/
+/// PREVIEW it reports as changed — and does *no* UI work at all for
+/// `Update::NONE` (e.g. `j` already on the last entry, or an out-of-range
+/// index), since nothing actually changed.
 ///
-/// A directory change isn't the only way the entry list can change: e.g.
-/// `ToggleHidden` rewrites `entries()` in place without moving
-/// `current_dir()` at all. Comparing only the directory left a real bug —
-/// `.` correctly dispatched `ToggleHidden` (state and its own tests were
-/// right) but the list view and status text never refreshed, because
-/// `sync_selection` only calls `invoke_set_selection`, not `set_entries`.
-/// Comparing the entry *count* alongside the directory catches that case
-/// too, without full_refresh needing to know which actions can grow or
-/// shrink the list.
+/// `AppState::dispatch` returns an [`crate::app::Update`] saying exactly
+/// which contexts it recomputed, so this never has to *infer* that by
+/// diffing entry counts or any other derived signal the way Milestone 2's
+/// `apply` did — that approach missed a real bug (`ToggleHidden` changed
+/// the listing without changing `current_dir`, so a directory-only check
+/// silently skipped the refresh) and would just as easily miss a same-
+/// length-but-different-content listing.
 ///
-/// Neither branch may hold a live `Ref`/`RefMut` on `state` while calling
-/// into `ui`: `invoke_set_selection` synchronously triggers
-/// `StandardListView::set-current-item`, which fires `current-item-changed`
-/// back into `on_selection_changed`, which itself calls
-/// `state.borrow_mut()`. A `SelectNext`/`SelectPrevious` used to hold `let
-/// st = state.borrow();` across exactly that call, so every plain `j`/`k`
-/// press re-entered the same `RefCell` and panicked
-/// ("already borrowed") — killing the whole process. Every helper below
-/// takes `&Rc<RefCell<AppState>>` and borrows only long enough to copy out
-/// the plain values it needs, so the borrow is gone before any `ui.*`/
+/// Neither this nor any helper it calls may hold a live `Ref`/`RefMut` on
+/// `state` while calling into `ui`: `invoke_set_selection` synchronously
+/// triggers `StandardListView::set-current-item`, which fires
+/// `current-item-changed` back into `on_selection_changed`, which itself
+/// calls `state.borrow_mut()`. A `SelectNext`/`SelectPrevious` used to hold
+/// `let st = state.borrow();` across exactly that call, so every plain
+/// `j`/`k` press re-entered the same `RefCell` and panicked ("already
+/// borrowed") — killing the whole process. Every helper below takes
+/// `&Rc<RefCell<AppState>>` and borrows only long enough to copy out the
+/// plain values it needs, so the borrow is gone before any `ui.*`/
 /// `invoke_*` call happens.
+///
+/// That same `sync_selection` round-trip is also why `select_by`/
+/// `select_index` in `AppState` treat re-selecting the already-selected
+/// index as a no-op: `sync_selection` below calls `invoke_set_selection`,
+/// which fires `current-item-changed` back into `on_selection_changed`,
+/// which dispatches `SelectIndex` a second time with the very index
+/// `AppState` just set — without that no-op check, PREVIEW would be
+/// rebuilt twice per keyboard press.
 fn apply(state: &Rc<RefCell<AppState>>, ui: &MainWindow, action: Action) {
-    let (dir_before, count_before) = {
-        let st = state.borrow();
-        (st.current_dir().to_path_buf(), st.entries().len())
-    };
-    state.borrow_mut().dispatch(action);
-    let (dir_changed, count_changed) = {
-        let st = state.borrow();
-        (
-            st.current_dir() != dir_before,
-            st.entries().len() != count_before,
-        )
-    };
-    if dir_changed || count_changed {
-        full_refresh(state, ui);
-    } else {
+    let update = state.borrow_mut().dispatch(action);
+    if update.current_changed {
+        full_refresh_current(state, ui);
+    } else if update.preview_changed {
         sync_selection(state, ui);
+    }
+    if update.parent_changed {
+        refresh_parent(state, ui);
+    }
+    if update.preview_changed {
+        refresh_preview(state, ui);
     }
 }
 
-fn full_refresh(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+fn full_refresh_current(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     let (items, path_text, status_text, index) = {
         let st = state.borrow();
         let items: Vec<StandardListViewItem> = st
@@ -209,6 +220,97 @@ fn full_refresh(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
 fn sync_selection(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     let index = state.borrow().selected().map(|i| i as i32).unwrap_or(-1);
     ui.invoke_set_selection(index);
+}
+
+/// A row's display label: a trailing "/" for directories, the bare name
+/// otherwise. Built here (never in `.slint`, which never inspects
+/// `EntryKind`) since it's the one place already converting `FileEntry`
+/// into UI-facing text.
+fn row_label(entry: &FileEntry) -> String {
+    let name = entry.name().to_string_lossy();
+    if entry.kind() == EntryKind::Directory {
+        format!("{name}/")
+    } else {
+        name.into_owned()
+    }
+}
+
+fn context_rows(entries: &[FileEntry], highlighted_index: Option<usize>) -> Vec<ContextRow> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| ContextRow {
+            text: row_label(entry).into(),
+            highlighted: Some(i) == highlighted_index,
+        })
+        .collect()
+}
+
+/// PARENT never needs the CURRENT/PREVIEW borrow-reentrancy dance: it has
+/// no interactive `.slint` widget wired to a callback that could call back
+/// into `state`, so there's nothing to keep this borrow scoped away from —
+/// but it's still dropped before the `ui.set_*` calls for consistency with
+/// every other helper here.
+fn refresh_parent(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+    let (has_parent, rows) = {
+        let st = state.borrow();
+        let parent = st.parent();
+        (
+            parent.dir().is_some(),
+            context_rows(parent.entries(), parent.current_index()),
+        )
+    };
+    ui.set_has_parent(has_parent);
+    ui.set_parent_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+fn refresh_preview(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+    let (mode, rows, label) = {
+        let st = state.borrow();
+        match st.preview() {
+            PreviewContext::None => ("none", Vec::new(), String::new()),
+            PreviewContext::Directory(children) => {
+                ("directory", context_rows(children, None), String::new())
+            }
+            PreviewContext::DirectoryUnavailable => (
+                "unavailable",
+                Vec::new(),
+                preview_label(&st, "Directory", "Unavailable"),
+            ),
+            PreviewContext::File => (
+                "file",
+                Vec::new(),
+                preview_label(&st, "Regular file", "Preview not implemented yet"),
+            ),
+            PreviewContext::Symlink => (
+                "symlink",
+                Vec::new(),
+                preview_label(&st, "Symlink", "Preview not implemented yet"),
+            ),
+            PreviewContext::Other => (
+                "other",
+                Vec::new(),
+                preview_label(&st, "Other", "Preview not implemented yet"),
+            ),
+        }
+        // `st` is dropped here, before any `ui.set_*` call.
+    };
+    ui.set_preview_mode(mode.into());
+    ui.set_preview_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+    ui.set_preview_label(label.into());
+}
+
+/// Builds a PREVIEW placeholder message for a non-directory (or unreadable-
+/// directory) selection: the selected entry's name, its kind, and a note
+/// that this is context only — Milestone 3 never reads file content, MIME,
+/// or generates a thumbnail; that's Milestone 4 (preview *content*
+/// providers).
+fn preview_label(state: &AppState, kind: &str, note: &str) -> String {
+    let name = state
+        .selected_entry()
+        .map(|entry| entry.name().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{name}\n\n{kind}\n\n{note}")
 }
 
 #[cfg(test)]
