@@ -46,19 +46,25 @@ export component MainWindow inherits Window {
     // PREVIEW: read-only context for whatever is selected in CURRENT.
     // `preview-mode` picks which of the views below to show; it's a tag
     // Rust computes from `PreviewContext`/`FilePreview` (never something
-    // `.slint` derives from file kind itself — see `ui/window.rs`). Both
-    // "directory" and "text" render `preview-entries` through the same
-    // per-row `ListView` below: `.slint` receives an already-validated-
-    // UTF-8, already-row-split list (see `ui/window.rs::preview_text_rows`)
-    // and does no filesystem I/O, truncation, or line-splitting of its
-    // own. "text" additionally shows `preview-truncated`. Every other mode
-    // ("none", "empty", "unsupported", "unavailable", "symlink", "other")
-    // shows `preview-label`, a plain contextual message. Never a MIME type
-    // or a thumbnail — out of scope for Milestone 4A.
+    // `.slint` derives from file kind, format, or bytes itself — see
+    // `ui/window.rs`). "directory" and "text" render `preview-entries`
+    // through the same per-row `ListView`: `.slint` receives an already-
+    // validated-UTF-8, already-row-split list (see
+    // `ui/window.rs::preview_text_rows`) and does no filesystem I/O,
+    // truncation, or line-splitting of its own. "text" additionally shows
+    // `preview-truncated`. "image" shows `preview-image` — already decoded
+    // and size-checked in Rust (`core::image::read_image_preview`); Slint
+    // never opens a file or decodes a format itself here, only paints
+    // pixels it was handed. Every other mode ("none", "empty",
+    // "unsupported", "unavailable", "symlink", "other") shows
+    // `preview-label`, a plain contextual message (this covers
+    // `FilePreview::TooLarge` too — a distinct label, not a distinct mode;
+    // see `ui/window.rs::refresh_preview`).
     in property <string> preview-mode: "none";
     in property <[ContextRow]> preview-entries;
     in property <string> preview-label: "";
     in property <bool> preview-truncated: false;
+    in property <image> preview-image;
 
     // UI never touches the filesystem or Navigation, and never decides
     // what a keystroke or click *means* — it only reports what happened.
@@ -331,7 +337,38 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    if root.preview-mode != "directory" && root.preview-mode != "text": Rectangle {
+                    // Image: `preview-image` already carries decoded,
+                    // size-checked pixels (see `core::image`) — this is
+                    // purely a paint step. `image-fit: contain` preserves
+                    // aspect ratio and never crops or deforms.
+                    //
+                    // Both this Rectangle's and the `Image`'s `width`/
+                    // `height` are bound explicitly to `100%` — not left
+                    // unset — because an `Image` element's *natural*
+                    // preferred-size is its source's pixel dimensions
+                    // (3840×2160 for a 4K photo), and an unset `Rectangle`
+                    // derives its own preferred-size from its child's. Left
+                    // unset, that native size leaked upward into the
+                    // surrounding `HorizontalLayout`'s stretch negotiation
+                    // and visibly squeezed PARENT/CURRENT — confirmed via
+                    // this milestone's own smoke testing. Binding `100%`
+                    // on both makes each one strictly *inherit* its
+                    // parent's already-computed size instead of
+                    // contributing a size of its own, which breaks that
+                    // feedback loop.
+                    if root.preview-mode == "image": Rectangle {
+                        width: 100%;
+                        height: 100%;
+                        Image {
+                            source: root.preview-image;
+                            width: 100%;
+                            height: 100%;
+                            preferred-width: 0px;
+                            preferred-height: 0px;
+                            image-fit: contain;
+                        }
+                    }
+                    if root.preview-mode != "directory" && root.preview-mode != "text" && root.preview-mode != "image": Rectangle {
                         Text {
                             text: root.preview-label;
                             color: #a6adc8;

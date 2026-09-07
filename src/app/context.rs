@@ -323,6 +323,74 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn preview_of_a_symlink_to_a_png_stays_symlink_never_reads_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new();
+        let real = dir.path().join("real.png");
+        let link = dir.path().join("image-link");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(&real, image::ImageFormat::Png)
+            .unwrap();
+        symlink(&real, &link).unwrap();
+        let link_entry = FileEntry::from_path(link).unwrap();
+
+        let preview = PreviewContext::build(Some(&link_entry), false);
+
+        assert!(matches!(preview, PreviewContext::Symlink));
+    }
+
+    #[test]
+    fn preview_of_a_valid_png_is_image() {
+        let dir = TempDir::new();
+        let path = dir.path().join("photo.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        let entry = FileEntry::from_path(path).unwrap();
+
+        let preview = PreviewContext::build(Some(&entry), false);
+
+        match preview {
+            PreviewContext::File(FilePreview::Image { width, height, .. }) => {
+                assert_eq!((width, height), (4, 4));
+            }
+            other => panic!("expected an Image preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_image_selection_does_not_change_current_dir_or_entries() {
+        let dir = TempDir::new();
+        image::RgbaImage::from_pixel(
+            crate::core::image::MAX_IMAGE_DIMENSION + 1,
+            1,
+            image::Rgba([0, 0, 0, 255]),
+        )
+        .save_with_format(dir.path().join("huge.png"), image::ImageFormat::Png)
+        .unwrap();
+        fs::write(dir.path().join("sibling.txt"), b"x").unwrap();
+        let entry = FileEntry::from_path(dir.path().join("huge.png")).unwrap();
+
+        let preview = PreviewContext::build(Some(&entry), false);
+
+        assert!(matches!(
+            preview,
+            PreviewContext::File(FilePreview::TooLarge)
+        ));
+        // Building a PREVIEW never touches the filesystem beyond the
+        // selected entry itself — nothing here could have changed
+        // `current_dir` or CURRENT's own listing, but assert the sibling
+        // is still exactly what it was as a concrete, non-tautological
+        // check.
+        assert_eq!(
+            fs::read(dir.path().join("sibling.txt")).unwrap(),
+            b"x".to_vec()
+        );
+    }
+
     #[test]
     fn preview_of_no_selection_is_neutral() {
         let preview = PreviewContext::build(None, false);

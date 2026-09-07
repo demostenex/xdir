@@ -13,6 +13,17 @@ slint = { version = "1.17", default-features = false, features = [
     "renderer-software",
     "compat-1-2",
 ] }
+# Already present in the dependency graph (Slint itself depends on it for
+# `@image-url`/`Image` support in `renderer-software`) — this declares it
+# directly so xdir's own code can use it, at the exact version already
+# resolved in Cargo.lock (0.25.10). `default-features = false` plus an
+# explicit `png`/`jpeg` feature list keeps this to Milestone 4B's scope
+# (no gif/webp/tiff/bmp/... decoders enabled by this crate's own request —
+# though `renderer-software` unifies in whatever *it* needs regardless).
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
 
 [build-dependencies]
 slint-build = "1.17"

@@ -5195,6 +5195,7 @@ dependencies = [
 name = "xdir"
 version = "0.1.0"
 dependencies = [
+ "image",
  "slint",
  "slint-build",
 ]

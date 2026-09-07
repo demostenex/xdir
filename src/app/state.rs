@@ -596,6 +596,28 @@ mod tests {
     }
 
     #[test]
+    fn reselecting_the_same_image_is_a_no_op_update_no_second_decode() {
+        let dir = TempDir::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(dir.path().join("a.png"), image::ImageFormat::Png)
+            .unwrap();
+        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(state.selected(), Some(0));
+        assert!(matches!(
+            state.preview(),
+            crate::app::PreviewContext::File(crate::app::FilePreview::Image { .. })
+        ));
+
+        // `refresh_preview` (and so `FilePreview::build`'s decode) only
+        // runs when `select_index` actually changes the selection — this
+        // dispatch, re-selecting the entry already selected, must be a
+        // pure no-op and therefore never re-decode the image.
+        let update = state.dispatch(Action::SelectIndex(0));
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
     fn activate_index_out_of_range_is_a_complete_no_op() {
         let dir = TempDir::new();
         fs::create_dir(dir.path().join("directory")).unwrap();

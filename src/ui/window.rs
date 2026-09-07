@@ -311,55 +311,93 @@ fn preview_text_rows(content: &str) -> Vec<ContextRow> {
     rows
 }
 
+/// Converts decoded RGBA8 pixels into a `slint::Image`. The one copy this
+/// requires (into Slint's own `SharedPixelBuffer`, a different memory
+/// representation than `Vec<u8>`) is unavoidable without either `app`
+/// depending on `slint::` types (breaking the layering) or `ui` depending
+/// on `AppState` fields it doesn't own — `SharedPixelBuffer::new` +
+/// `make_mut_bytes` is the most direct documented path Slint 1.17.1 offers
+/// for "I already decoded pixels myself, here they are".
+fn to_slint_image(width: u32, height: u32, rgba: &[u8]) -> slint::Image {
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+    buffer.make_mut_bytes().copy_from_slice(rgba);
+    slint::Image::from_rgba8(buffer)
+}
+
 fn refresh_preview(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
-    let (mode, rows, label, truncated) = {
+    let (mode, rows, label, truncated, image) = {
         let st = state.borrow();
         match st.preview() {
-            PreviewContext::None => ("none", Vec::new(), String::new(), false),
+            PreviewContext::None => ("none", Vec::new(), String::new(), false, None),
             PreviewContext::Directory(children) => (
                 "directory",
                 context_rows(children, None),
                 String::new(),
                 false,
+                None,
             ),
             PreviewContext::DirectoryUnavailable => (
                 "unavailable",
                 Vec::new(),
                 preview_label(&st, "Directory", "Unavailable"),
                 false,
+                None,
             ),
             PreviewContext::File(FilePreview::Text { content, .. }) if content.is_empty() => {
-                ("empty", Vec::new(), "(empty file)".to_string(), false)
+                ("empty", Vec::new(), "(empty file)".to_string(), false, None)
             }
             PreviewContext::File(FilePreview::Text { content, truncated }) => (
                 "text",
                 preview_text_rows(content),
                 String::new(),
                 *truncated,
+                None,
+            ),
+            PreviewContext::File(FilePreview::Image {
+                width,
+                height,
+                rgba,
+            }) => (
+                "image",
+                Vec::new(),
+                String::new(),
+                false,
+                Some(to_slint_image(*width, *height, rgba)),
+            ),
+            PreviewContext::File(FilePreview::TooLarge) => (
+                "unsupported",
+                Vec::new(),
+                preview_label(&st, "Image", "Too large to preview"),
+                false,
+                None,
             ),
             PreviewContext::File(FilePreview::Unsupported) => (
                 "unsupported",
                 Vec::new(),
                 preview_label(&st, "Regular file", "Preview not available"),
                 false,
+                None,
             ),
             PreviewContext::File(FilePreview::Unavailable) => (
                 "unavailable",
                 Vec::new(),
                 preview_label(&st, "Regular file", "Unavailable"),
                 false,
+                None,
             ),
             PreviewContext::Symlink => (
                 "symlink",
                 Vec::new(),
                 preview_label(&st, "Symlink", "Preview not implemented yet"),
                 false,
+                None,
             ),
             PreviewContext::Other => (
                 "other",
                 Vec::new(),
                 preview_label(&st, "Other", "Preview not implemented yet"),
                 false,
+                None,
             ),
         }
         // `st` is dropped here, before any `ui.set_*` call.
@@ -368,6 +406,7 @@ fn refresh_preview(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     ui.set_preview_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
     ui.set_preview_label(label.into());
     ui.set_preview_truncated(truncated);
+    ui.set_preview_image(image.unwrap_or_default());
 }
 
 /// Builds a PREVIEW placeholder message for a non-directory (or unreadable-
