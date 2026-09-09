@@ -24,6 +24,17 @@ image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
 ] }
+# Milestone 5A (Places foundation): resolves the real home dir and the six
+# XDG user directories (Desktop/Documents/Downloads/Pictures/Music/Videos).
+# On Linux this parses `$XDG_CONFIG_HOME/user-dirs.dirs` (default
+# `~/.config/user-dirs.dirs`) correctly — respecting whatever path/language
+# the user actually configured, never guessing English folder names. It's
+# the small, mature crate for exactly this (backed by `dirs-sys`, used
+# across the Rust ecosystem); it has no optional features to trim, and its
+# only dependency is `dirs-sys` itself. Rolling a `user-dirs.dirs` parser
+# by hand would just re-implement what this already gets right (shell
+# unescaping, `$HOME` interpolation, the disabled-directory convention).
+directories = "6.0.0"
 
 [build-dependencies]
 slint-build = "1.17"
