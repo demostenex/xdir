@@ -24,11 +24,12 @@ export component MainWindow inherits Window {
     preferred-width: 960px;
     preferred-height: 420px;
     background: #1e1e2e;
-    // xdir's standard typeface. Centralized here (not repeated per Text/
-    // widget) so it's inherited window-wide; the fontconfig family name
-    // confirmed installed on this machine's Nerd Font package is "MesloLGS
-    // Nerd Font Mono", not the shorter "MesloLGS NF" alias some installers
-    // register.
+    // xdir's default typeface, resolved by the system's fontconfig (see
+    // `fc-match "MesloLGS Nerd Font Mono"`), for text that inherits the
+    // Window default rather than setting its own `font-family`. CURRENT's
+    // `StandardListView` delegate (the `fluent-dark` style's built-in
+    // `ListItem`) is a known exception: it does not inherit this value —
+    // see the M5B typography-limitation note.
     default-font-family: "MesloLGS Nerd Font Mono";
 
     in property <string> path-text: "";
@@ -214,6 +215,10 @@ export component MainWindow inherits Window {
                                     if (root.key-input("Left", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
                                 } else if (event.text == Key.RightArrow) {
                                     if (root.key-input("Right", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                                } else if (event.text == Key.Escape) {
+                                    if (root.key-input("Escape", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
+                                } else if (event.text == Key.Shift || event.text == Key.ShiftR) {
+                                    if (root.key-input("Shift", event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) { accept } else { reject }
                                 } else if (root.key-input(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt, event.modifiers.meta)) {
                                     accept
                                 } else {

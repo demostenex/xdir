@@ -74,6 +74,16 @@ impl Place {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Builds a `Place` directly from an already-decided kind/path pair,
+    /// bypassing discovery entirely. Test-only seam for crates upstream of
+    /// `places` (e.g. `app::state`) that need a deterministic `Vec<Place>`
+    /// without touching the real `$HOME`/XDG configuration — production
+    /// code only ever gets a `Place` through [`system_places`].
+    #[cfg(test)]
+    pub(crate) fn new_for_test(kind: SystemPlaceKind, path: PathBuf) -> Self {
+        Place { kind, path }
+    }
 }
 
 /// Identity is the path alone — `kind` is presentation/ordering metadata

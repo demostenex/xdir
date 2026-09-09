@@ -6,7 +6,7 @@ use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
 use crate::app::{Action, AppState, FilePreview, PreviewContext};
 use crate::model::{EntryKind, FileEntry};
-use crate::ui::input::{self, KeyStroke};
+use crate::ui::input::{KeyStroke, Keymap, KeymapResult};
 
 slint::include_modules!();
 
@@ -73,6 +73,7 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let state = Rc::new(RefCell::new(state));
     let clicks = Rc::new(RefCell::new(ClickTracker::new(DOUBLE_CLICK_WINDOW)));
+    let keymap = Rc::new(RefCell::new(Keymap::new()));
 
     full_refresh_current(&state, &ui);
     refresh_parent(&state, &ui);
@@ -80,27 +81,57 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     ui.invoke_focus_list();
 
     // `.slint` only names the physical key (a literal character, or one
-    // of the "Up"/"Down"/"Left"/"Right" tags it substitutes for the arrow
-    // keys it alone can recognize) and reports raw modifier flags; it
+    // of the "Up"/"Down"/"Left"/"Right"/"Escape"/"Shift" tags it
+    // substitutes for the keys only it can recognize) and reports raw
+    // modifier flags; it
     // never decides what any of that means. `KeyStroke::new` turns that
-    // into a toolkit-neutral value and `input::resolve` (the keymap) is
-    // the one place that says "j and Down both mean select-next". The
-    // returned bool tells `.slint` whether to consume the event
-    // (`Handled`) or leave it alone (`Ignored`), e.g. for the window
-    // manager.
+    // into a toolkit-neutral value and `Keymap` (the keymap itself) is the
+    // one place that says "j and Down both mean select-next" — and, since
+    // some xdir commands are two keys long (`gg`, `g h`, ...), the one
+    // place holding the one bit of state that remembers a lone `g` until
+    // the next keystroke decides what it meant. The returned bool tells
+    // `.slint` whether to consume the event (`Handled`) or leave it alone
+    // (`Ignored`), e.g. for the window manager.
     ui.on_key_input({
         let state = state.clone();
+        let keymap = keymap.clone();
         let ui = ui.as_weak();
         move |raw, shift, control, alt, meta| {
             let ui = ui.unwrap();
             let Some(stroke) = KeyStroke::new(&raw, shift, control, alt, meta) else {
+                // A key `KeyStroke::new` can't even name (e.g. a function
+                // key) still counts as "a new keystroke arrived" for the
+                // pending-`g` contract: it must not survive to let some
+                // later, unrelated key complete it as if it were `g`'s own
+                // continuation. The event itself stays fully unhandled —
+                // this only ever drops a stale prefix, never claims the
+                // keystroke or produces an `Action`.
+                keymap.borrow_mut().cancel_pending();
                 return false;
             };
-            let Some(action) = input::resolve(stroke) else {
-                return false;
-            };
-            apply(&state, &ui, action);
-            true
+            // `keymap.borrow_mut()` must not still be live once `apply`
+            // runs: a successful `GoSystemPlace`/`SelectFirst`/... syncs
+            // selection back through Slint's `current-item-changed`, which
+            // re-enters `on_selection_changed` below and calls
+            // `keymap.borrow_mut().cancel_pending()` — the same reentrancy
+            // hazard `apply`'s own doc comment describes for `state`. Using
+            // the temporary as the `match` scrutinee directly would extend
+            // its borrow across the whole match (including the `apply`
+            // call in this arm), so the result is copied out first.
+            let result = keymap.borrow_mut().resolve(stroke);
+            match result {
+                KeymapResult::Action(action) => {
+                    apply(&state, &ui, action);
+                    true
+                }
+                // A lone `g` consumed while the keymap waits for its
+                // continuation, or a whole invalid sequence (an
+                // unrecognized continuation, or `Esc`) cancelled outright:
+                // either way nothing reaches `AppState`, but the keystroke
+                // itself is still ours, not the window manager's.
+                KeymapResult::Pending | KeymapResult::Cancelled => true,
+                KeymapResult::Unhandled => false,
+            }
         }
     });
 
@@ -113,10 +144,17 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     // `refresh_preview`. `select_index`'s no-op-on-unchanged-index guard
     // (see its doc comment) keeps this safe even though Slint's own
     // `current-item-changed` already reflects the click.
+    //
+    // A mouse selection is a fresh interaction unrelated to any in-flight
+    // keyboard sequence, so it cancels a pending `g` first — otherwise `g`,
+    // click elsewhere, `h` would resolve as `Home` instead of the ordinary
+    // `GoParent` the stray `h` alone should mean.
     ui.on_selection_changed({
         let state = state.clone();
+        let keymap = keymap.clone();
         let ui = ui.as_weak();
         move |index| {
+            keymap.borrow_mut().cancel_pending();
             if index >= 0 {
                 let ui = ui.unwrap();
                 apply(&state, &ui, Action::SelectIndex(index as usize));
@@ -127,12 +165,17 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     // `current-item-changed` stays silent on a repeat click of the
     // already-selected row, so double-click can't be detected from it.
     // `item-pointer-event` fires on every press regardless — including
-    // right/middle clicks, which `ClickTracker` ignores outright.
+    // right/middle clicks, which `ClickTracker` ignores outright but which
+    // still count as a fresh mouse interaction, so a pending `g` is
+    // cancelled here unconditionally too, before the click/button kind is
+    // even inspected.
     ui.on_item_pressed({
         let state = state.clone();
         let ui = ui.as_weak();
         let clicks = clicks.clone();
+        let keymap = keymap.clone();
         move |index, is_left| {
+            keymap.borrow_mut().cancel_pending();
             let ui = ui.unwrap();
             let index = index as usize;
             let outcome = clicks.borrow_mut().register(index, is_left);

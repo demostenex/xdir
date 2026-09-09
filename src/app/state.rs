@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::app::{Action, ParentContext, PreviewContext};
 use crate::core::navigation::Navigation;
+use crate::core::places::{self, Place, SystemPlaceKind};
 use crate::model::FileEntry;
 
 /// What a `dispatch` call actually changed, so the UI layer never has to
@@ -52,10 +53,24 @@ pub struct AppState {
     selected: Option<usize>,
     parent: ParentContext,
     preview: PreviewContext,
+    places: Vec<Place>,
 }
 
 impl AppState {
+    /// Discovers the real system places once, at startup — see
+    /// [`Self::with_places`] for why this is a snapshot, never re-read.
     pub fn new(navigation: Navigation) -> Self {
+        Self::with_places(navigation, places::system_places())
+    }
+
+    /// Builds `AppState` with an explicit, already-resolved `places` list
+    /// instead of discovering it from the real `$HOME`/XDG configuration.
+    /// This is the seam tests use to exercise `GoSystemPlace` with
+    /// deterministic, isolated paths — production always goes through
+    /// [`Self::new`], which calls [`places::system_places`]. `places` is a
+    /// one-time snapshot taken at construction: XDG configuration is not
+    /// live-reloaded, watched, or polled.
+    pub(crate) fn with_places(navigation: Navigation, places: Vec<Place>) -> Self {
         let entries = navigation.entries().unwrap_or_default();
         let selected = initial_selection(&entries);
         let parent = ParentContext::build(navigation.current_dir(), navigation.show_hidden());
@@ -69,6 +84,7 @@ impl AppState {
             selected,
             parent,
             preview,
+            places,
         }
     }
 
@@ -107,6 +123,8 @@ impl AppState {
             Action::SelectNext => self.select_by(1),
             Action::SelectPrevious => self.select_by(-1),
             Action::SelectIndex(index) => self.select_index(index),
+            Action::SelectFirst => self.select_first(),
+            Action::SelectLast => self.select_last(),
             Action::ActivateSelected => self.activate_selected(),
             Action::ActivateIndex(index) => {
                 if index >= self.entries.len() {
@@ -124,6 +142,7 @@ impl AppState {
                 }
             }
             Action::GoParent => self.go_parent(),
+            Action::GoSystemPlace(kind) => self.go_system_place(kind),
             Action::ToggleHidden => self.toggle_hidden(),
         }
     }
@@ -164,6 +183,51 @@ impl AppState {
         self.selected = Some(index);
         self.refresh_preview();
         Update::PREVIEW_ONLY
+    }
+
+    /// Selects the first entry (`gg`). A no-op — `Update::NONE`, no preview
+    /// rebuild — both when CURRENT is empty and when the first entry is
+    /// already selected, via the same re-selection guard as [`Self::select_index`].
+    fn select_first(&mut self) -> Update {
+        if self.entries.is_empty() {
+            Update::NONE
+        } else {
+            self.select_index(0)
+        }
+    }
+
+    /// Selects the last entry (`G`). Same no-op guarantees as
+    /// [`Self::select_first`], mirrored for the other end of the list.
+    fn select_last(&mut self) -> Update {
+        if self.entries.is_empty() {
+            Update::NONE
+        } else {
+            self.select_index(self.entries.len() - 1)
+        }
+    }
+
+    /// Navigates to the snapshot [`Place`] of the given kind, if one was
+    /// discovered at startup (see [`Self::with_places`]). A `kind` missing
+    /// from the snapshot (not configured, or deduplicated away by an
+    /// earlier place sharing its path), a target already equal to the
+    /// current directory, or a target that no longer resolves to a
+    /// directory (e.g. removed since discovery) are all safe no-ops —
+    /// `current_dir`/CURRENT are left completely untouched, exactly like
+    /// any other failed navigation.
+    fn go_system_place(&mut self, kind: SystemPlaceKind) -> Update {
+        let Some(place) = self.places.iter().find(|place| place.kind() == kind) else {
+            return Update::NONE;
+        };
+        if place.path() == self.navigation.current_dir() {
+            return Update::NONE;
+        }
+        let target = place.path().to_path_buf();
+        if self.navigation.navigate_to(&target).is_ok() {
+            self.reload();
+            Update::ALL
+        } else {
+            Update::NONE
+        }
     }
 
     /// Activates the selected entry. Only directories (or symlinks that
@@ -255,6 +319,18 @@ mod tests {
     use crate::test_support::TempDir;
     use std::fs;
 
+    /// Builds `AppState` for tests that are not specifically exercising
+    /// `GoSystemPlace`/Places. `AppState::new` now takes its `places`
+    /// snapshot from `places::system_places()` — the real `$HOME`/XDG
+    /// configuration of whatever machine runs the test — so every test
+    /// that doesn't care about Places uses this instead, with an empty
+    /// snapshot, to stay fully deterministic. Tests that DO exercise
+    /// Places call `AppState::with_places` directly with their own
+    /// controlled `Vec<Place>` (see `state_with_places` further down).
+    fn test_state(navigation: Navigation) -> AppState {
+        AppState::with_places(navigation, Vec::new())
+    }
+
     fn names(state: &AppState) -> Vec<String> {
         state
             .entries()
@@ -269,7 +345,7 @@ mod tests {
         fs::write(dir.path().join("a.txt"), b"").unwrap();
         fs::write(dir.path().join("b.txt"), b"").unwrap();
 
-        let state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         assert_eq!(names(&state), vec!["a.txt", "b.txt"]);
     }
@@ -278,7 +354,7 @@ mod tests {
     fn empty_directory_has_no_selection() {
         let dir = TempDir::new();
 
-        let state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         assert_eq!(state.selected(), None);
     }
@@ -288,7 +364,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
 
-        let state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         assert_eq!(state.selected(), Some(0));
     }
@@ -298,7 +374,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
         fs::write(dir.path().join("b.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         state.dispatch(Action::SelectNext);
         state.dispatch(Action::SelectNext);
@@ -312,7 +388,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
         fs::write(dir.path().join("b.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         state.dispatch(Action::SelectPrevious);
         state.dispatch(Action::SelectPrevious);
@@ -324,7 +400,7 @@ mod tests {
     fn activate_selected_enters_a_directory() {
         let dir = TempDir::new();
         fs::create_dir(dir.path().join("sub")).unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         state.dispatch(Action::ActivateSelected);
 
@@ -336,7 +412,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join("a_file.txt"), b"").unwrap();
         fs::create_dir(dir.path().join("z_dir")).unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         // sorted: directories first, so "z_dir" is index 0 and "a_file.txt" is index 1
         assert_eq!(names(&state), vec!["z_dir", "a_file.txt"]);
 
@@ -351,7 +427,7 @@ mod tests {
         let sub = dir.path().join("sub");
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("inner.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(sub).unwrap());
+        let mut state = test_state(Navigation::new(sub).unwrap());
         assert_eq!(names(&state), vec!["inner.txt"]);
 
         state.dispatch(Action::GoParent);
@@ -364,7 +440,7 @@ mod tests {
     fn changing_directory_resets_selection() {
         let dir = TempDir::new();
         fs::create_dir(dir.path().join("sub")).unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         state.dispatch(Action::ActivateSelected);
 
@@ -375,7 +451,7 @@ mod tests {
     fn invalid_index_does_not_corrupt_state() {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         state.dispatch(Action::SelectIndex(999));
         assert_eq!(state.selected(), Some(0));
@@ -390,7 +466,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join(".hidden"), b"").unwrap();
         fs::write(dir.path().join("visible.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         assert!(!state.show_hidden());
         assert_eq!(names(&state), vec!["visible.txt"]);
 
@@ -408,7 +484,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join(".hidden"), b"").unwrap();
         fs::write(dir.path().join("visible.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         // Only "visible.txt" is listed yet, so it's the one selected.
         let selected_path = state.selected_entry().unwrap().path().to_path_buf();
 
@@ -428,7 +504,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join(".hidden"), b"").unwrap();
         fs::write(dir.path().join("visible.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         state.dispatch(Action::ToggleHidden); // show hidden: [".hidden", "visible.txt"]
         state.dispatch(Action::SelectIndex(0)); // select ".hidden"
 
@@ -442,7 +518,7 @@ mod tests {
     fn toggle_hidden_on_a_dotfile_only_directory_can_empty_or_repopulate_the_listing() {
         let dir = TempDir::new();
         fs::write(dir.path().join(".only"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         assert_eq!(state.selected(), None);
 
         state.dispatch(Action::ToggleHidden);
@@ -457,7 +533,7 @@ mod tests {
         let dir = TempDir::new();
         fs::create_dir(dir.path().join("a_dir")).unwrap();
         fs::create_dir(dir.path().join("b_dir")).unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         assert_eq!(names(&state), vec!["a_dir", "b_dir"]);
         let parent_before = state.parent().entries().len();
 
@@ -488,7 +564,7 @@ mod tests {
         // Sorts after "sub" (dirs-first, then alphabetical), so "sub"
         // stays the initial selection at index 0.
         fs::create_dir(dir.path().join("zzz_sibling")).unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         let update = state.dispatch(Action::ActivateSelected);
 
@@ -524,7 +600,7 @@ mod tests {
         fs::write(dir.path().join(".hidden"), b"").unwrap();
         fs::create_dir(dir.path().join("visible_dir")).unwrap();
         fs::write(dir.path().join("visible_dir/.child_hidden"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         let update = state.dispatch(Action::ToggleHidden);
 
@@ -546,7 +622,7 @@ mod tests {
     fn a_no_op_action_reports_no_update() {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
 
         // "a.txt" is a regular file: ActivateSelected is a deliberate no-op.
         let update = state.dispatch(Action::ActivateSelected);
@@ -559,7 +635,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
         fs::write(dir.path().join("b.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         state.dispatch(Action::SelectNext); // now on "b.txt", the last entry
         assert_eq!(state.selected(), Some(1));
 
@@ -574,7 +650,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
         fs::write(dir.path().join("b.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         assert_eq!(state.selected(), Some(0)); // already on "a.txt", the first entry
 
         let update = state.dispatch(Action::SelectPrevious);
@@ -587,7 +663,7 @@ mod tests {
     fn select_index_of_the_already_selected_entry_is_a_no_op_update() {
         let dir = TempDir::new();
         fs::write(dir.path().join("a.txt"), b"").unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         assert_eq!(state.selected(), Some(0));
 
         let update = state.dispatch(Action::SelectIndex(0));
@@ -601,7 +677,7 @@ mod tests {
         image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
             .save_with_format(dir.path().join("a.png"), image::ImageFormat::Png)
             .unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         assert_eq!(state.selected(), Some(0));
         assert!(matches!(
             state.preview(),
@@ -621,7 +697,7 @@ mod tests {
     fn activate_index_out_of_range_is_a_complete_no_op() {
         let dir = TempDir::new();
         fs::create_dir(dir.path().join("directory")).unwrap();
-        let mut state = AppState::new(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
         // "directory" is selected (the only entry).
         assert_eq!(state.selected(), Some(0));
 
@@ -632,5 +708,280 @@ mod tests {
         assert_eq!(update, Update::NONE);
         assert_eq!(state.selected(), Some(0));
         assert_eq!(state.current_dir(), dir.path());
+    }
+
+    // --- SelectFirst / SelectLast ---------------------------------------
+
+    fn three_entry_state() -> (TempDir, AppState) {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("a.txt"), b"contents-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"contents-b").unwrap();
+        fs::write(dir.path().join("c.txt"), b"contents-c").unwrap();
+        let state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        (dir, state)
+    }
+
+    #[test]
+    fn select_first_moves_to_first_item() {
+        let (_dir, mut state) = three_entry_state();
+        state.dispatch(Action::SelectNext);
+        state.dispatch(Action::SelectNext);
+        assert_eq!(state.selected(), Some(2));
+
+        let update = state.dispatch(Action::SelectFirst);
+
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(update, Update::PREVIEW_ONLY);
+    }
+
+    #[test]
+    fn select_first_when_already_first_returns_none() {
+        let (_dir, mut state) = three_entry_state();
+        assert_eq!(state.selected(), Some(0));
+
+        let update = state.dispatch(Action::SelectFirst);
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn select_last_moves_to_last_item() {
+        let (_dir, mut state) = three_entry_state();
+        assert_eq!(state.selected(), Some(0));
+
+        let update = state.dispatch(Action::SelectLast);
+
+        assert_eq!(state.selected(), Some(2));
+        assert_eq!(update, Update::PREVIEW_ONLY);
+    }
+
+    #[test]
+    fn select_last_when_already_last_returns_none() {
+        let (_dir, mut state) = three_entry_state();
+        state.dispatch(Action::SelectLast);
+        assert_eq!(state.selected(), Some(2));
+
+        let update = state.dispatch(Action::SelectLast);
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn select_first_on_empty_returns_none() {
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(state.selected(), None);
+
+        let update = state.dispatch(Action::SelectFirst);
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn select_last_on_empty_returns_none() {
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(state.selected(), None);
+
+        let update = state.dispatch(Action::SelectLast);
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    #[test]
+    fn select_first_real_change_rebuilds_preview_exactly_once() {
+        let (_dir, mut state) = three_entry_state();
+        state.dispatch(Action::SelectLast);
+        let before = format!("{:?}", state.preview());
+
+        let update = state.dispatch(Action::SelectFirst);
+
+        assert_eq!(update, Update::PREVIEW_ONLY);
+        assert_ne!(format!("{:?}", state.preview()), before);
+        assert!(!update.current_changed);
+        assert!(!update.parent_changed);
+    }
+
+    // --- GoSystemPlace ----------------------------------------------------
+
+    fn place_dir(root: &TempDir, name: &str) -> std::path::PathBuf {
+        let path = root.path().join(name);
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn state_with_places(start: std::path::PathBuf, places: Vec<Place>) -> AppState {
+        AppState::with_places(Navigation::new(start).unwrap(), places)
+    }
+
+    #[test]
+    fn go_home_navigates_to_home_place() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let home = place_dir(&root, "home");
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, home.clone())];
+        let mut state = state_with_places(start, places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), home);
+    }
+
+    #[test]
+    fn go_downloads_navigates_to_downloads() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let downloads = place_dir(&root, "downloads");
+        let places = vec![Place::new_for_test(
+            SystemPlaceKind::Downloads,
+            downloads.clone(),
+        )];
+        let mut state = state_with_places(start, places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Downloads));
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), downloads);
+    }
+
+    #[test]
+    fn go_documents_navigates_to_documents() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let documents = place_dir(&root, "documents");
+        let places = vec![Place::new_for_test(
+            SystemPlaceKind::Documents,
+            documents.clone(),
+        )];
+        let mut state = state_with_places(start, places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Documents));
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), documents);
+    }
+
+    #[test]
+    fn go_pictures_navigates_to_pictures() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let pictures = place_dir(&root, "pictures");
+        let places = vec![Place::new_for_test(
+            SystemPlaceKind::Pictures,
+            pictures.clone(),
+        )];
+        let mut state = state_with_places(start, places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Pictures));
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), pictures);
+    }
+
+    #[test]
+    fn go_music_navigates_to_music() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let music = place_dir(&root, "music");
+        let places = vec![Place::new_for_test(SystemPlaceKind::Music, music.clone())];
+        let mut state = state_with_places(start, places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Music));
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), music);
+    }
+
+    #[test]
+    fn go_videos_navigates_to_videos() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let videos = place_dir(&root, "videos");
+        let places = vec![Place::new_for_test(SystemPlaceKind::Videos, videos.clone())];
+        let mut state = state_with_places(start, places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Videos));
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), videos);
+    }
+
+    #[test]
+    fn missing_place_is_noop() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let mut state = state_with_places(start.clone(), Vec::new());
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(update, Update::NONE);
+        assert_eq!(state.current_dir(), start);
+    }
+
+    #[test]
+    fn target_same_as_current_is_noop() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, start.clone())];
+        let mut state = state_with_places(start.clone(), places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(update, Update::NONE);
+        assert_eq!(state.current_dir(), start);
+    }
+
+    #[test]
+    fn disappearing_place_does_not_change_current_dir() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let ghost = root.path().join("ghost");
+        fs::create_dir(&ghost).unwrap();
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, ghost.clone())];
+        fs::remove_dir(&ghost).unwrap();
+        let mut state = state_with_places(start.clone(), places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(update, Update::NONE);
+        assert_eq!(state.current_dir(), start);
+    }
+
+    #[test]
+    fn failed_place_navigation_does_not_change_current_entries() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        fs::write(start.join("keep.txt"), b"").unwrap();
+        let ghost = root.path().join("ghost");
+        fs::create_dir(&ghost).unwrap();
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, ghost.clone())];
+        fs::remove_dir(&ghost).unwrap();
+        let mut state = state_with_places(start, places);
+
+        state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(names(&state), vec!["keep.txt"]);
+    }
+
+    #[test]
+    fn successful_place_navigation_updates_parent_current_and_preview() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let home = place_dir(&root, "home");
+        fs::create_dir(home.join("inner")).unwrap();
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, home.clone())];
+        let mut state = state_with_places(start, places);
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), home);
+        assert_eq!(state.parent().dir(), Some(root.path()));
+        assert_eq!(names(&state), vec!["inner"]);
+        match state.preview() {
+            PreviewContext::Directory(children) => assert!(children.is_empty()),
+            other => panic!("expected Directory preview for inner, got {other:?}"),
+        }
     }
 }
