@@ -132,8 +132,58 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
                 // either way nothing reaches `AppState`, but the keystroke
                 // itself is still ours, not the window manager's.
                 KeymapResult::Pending | KeymapResult::Cancelled => true,
+                // `/`: no `AppState` change (see `KeymapResult::EnterFilter`'s
+                // own doc comment) — just show FILTER's input, pre-filled
+                // with whatever query is already active, and move keyboard
+                // focus to it in the same tick.
+                KeymapResult::EnterFilter => {
+                    begin_filter_edit(&state, &ui);
+                    true
+                }
                 KeymapResult::Unhandled => false,
             }
+        }
+    });
+
+    // FILTER's input box reports its live text here on every keystroke
+    // (typing, Backspace, paste, ...) — never just on commit — since the
+    // query already filters CURRENT live while the box is open (see
+    // `ui/main.slint`'s `filter-input`/`AppState::set_filter_query`).
+    ui.on_filter_edited({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move |text| {
+            let ui = ui.unwrap();
+            apply(&state, &ui, Action::SetFilterQuery(text.to_string()));
+        }
+    });
+
+    // Enter, while FILTER is being edited: `AppState` needs no call at all
+    // — the query already filtered CURRENT live as it was typed — this is
+    // purely "close the box, give keyboard focus back to CURRENT" so a `j`
+    // typed right after navigates instead of vanishing into a hidden text
+    // box.
+    ui.on_filter_accepted({
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            ui.set_filter_editing(false);
+            ui.invoke_focus_list();
+        }
+    });
+
+    // Esc, while FILTER is being edited: unlike Enter, this does reach
+    // `AppState` — the milestone's frozen rule is that Esc during editing
+    // clears the filter outright (no draft-vs-committed distinction), not
+    // just closes the box on whatever was last typed.
+    ui.on_filter_escaped({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            apply(&state, &ui, Action::ClearFilter);
+            ui.set_filter_editing(false);
+            ui.invoke_focus_list();
         }
     });
 
@@ -237,11 +287,23 @@ fn apply(state: &Rc<RefCell<AppState>>, ui: &MainWindow, action: Action) {
     }
 }
 
+/// Shows FILTER's input box and moves keyboard focus to it — pre-filled
+/// with whatever query is already active, so pressing `/` again while a
+/// filter is already committed reopens it for editing rather than starting
+/// over (the milestone's frozen "reopen `/`" rule). No `AppState` call: the
+/// query itself is untouched by opening the box.
+fn begin_filter_edit(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+    let query = state.borrow().filter_query().to_string();
+    ui.set_filter_query(query.into());
+    ui.set_filter_editing(true);
+    ui.invoke_focus_filter_input();
+}
+
 fn full_refresh_current(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
-    let (rows, path_text, status_text, index) = {
+    let (rows, path_text, status_text, mode_text, index) = {
         let st = state.borrow();
-        let rows: Vec<EntryRow> = st
-            .entries()
+        let visible = st.visible_entries();
+        let rows: Vec<EntryRow> = visible
             .iter()
             .map(|entry| EntryRow {
                 text: row_label(entry).into(),
@@ -249,21 +311,39 @@ fn full_refresh_current(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
             })
             .collect();
         let path_text = st.current_dir().display().to_string();
-        let status_text = format!("{} items", st.entries().len());
-        let index = st.selected().map(|i| i as i32).unwrap_or(-1);
-        (rows, path_text, status_text, index)
+        let query = st.filter_query();
+        // FILTER never re-counts the directory from the filesystem: both
+        // numbers below are lengths of lists already in memory
+        // (`visible_entries()`/`entries()`), not a fresh read.
+        let status_text = if query.is_empty() {
+            format!("{} items", st.entries().len())
+        } else {
+            format!("{} / {} items", visible.len(), st.entries().len())
+        };
+        let mode_text = if query.is_empty() {
+            "NORMAL".to_string()
+        } else {
+            format!("FILTER: {query}")
+        };
+        let index = st.visible_selected_index().map(|i| i as i32).unwrap_or(-1);
+        (rows, path_text, status_text, mode_text, index)
         // `st` (the borrow) is dropped here, before any `ui`/`invoke_*` call.
     };
     ui.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
     ui.set_path_text(path_text.into());
     ui.set_status_text(status_text.into());
+    ui.set_mode_text(mode_text.into());
     ui.invoke_reset_scroll();
     ui.set_current_index(index);
     ui.invoke_scroll_to_index(index);
 }
 
 fn sync_selection(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
-    let index = state.borrow().selected().map(|i| i as i32).unwrap_or(-1);
+    let index = state
+        .borrow()
+        .visible_selected_index()
+        .map(|i| i as i32)
+        .unwrap_or(-1);
     ui.set_current_index(index);
     ui.invoke_scroll_to_index(index);
 }

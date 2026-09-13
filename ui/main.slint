@@ -131,6 +131,27 @@ export component MainWindow inherits Window {
     in property <bool> preview-truncated: false;
     in property <image> preview-image;
 
+    // FILTER: a local, incremental substring filter over CURRENT's
+    // already-loaded entries — no filesystem traversal happens here or in
+    // `AppState` for this (see `ui/window.rs`). `filter-query` is a
+    // two-way alias straight through to the editable `TextInput` below
+    // (the same `text <=> text-input.text` pattern Slint's own `LineEdit`
+    // uses to expose an editable primitive's text outward), so Rust can
+    // both read the live text on every keystroke (`filter-edited`) and
+    // pre-fill it when `/` reopens an already-active filter. `filter-
+    // editing` is pure UI-focus state, never `AppState`: it only decides
+    // whether the input box is shown and focused — the query itself keeps
+    // filtering CURRENT live whether or not the box happens to be open
+    // right now. `mode-text` is the bottom bar's left-hand label
+    // ("NORMAL" / "FILTER: <query>"), built entirely in Rust like every
+    // other display string here — `.slint` never decides what it says.
+    in-out property <string> filter-query: "";
+    in property <bool> filter-editing: false;
+    in property <string> mode-text: "NORMAL";
+    callback filter-edited(string);
+    callback filter-accepted();
+    callback filter-escaped();
+
     // UI never touches the filesystem or Navigation, and never decides
     // what a keystroke or click *means* — it only reports what happened.
     // `key-input` forwards the pressed key's raw text (or, for the arrow
@@ -175,6 +196,14 @@ export component MainWindow inherits Window {
 
     public function focus-list() {
         focus-scope.focus();
+    }
+
+    // Called right after `/` (fresh or reopening an active filter) shows
+    // the input box, so keyboard focus moves there in the same tick —
+    // never left for a later frame, which is what `key-input`'s FocusScope
+    // would otherwise still be holding.
+    public function focus-filter-input() {
+        filter-input.focus();
     }
 
     VerticalLayout {
@@ -579,11 +608,86 @@ export component MainWindow inherits Window {
                 x: 10px;
                 vertical-alignment: center;
             }
-            Text {
-                text: "NORMAL";
-                color: Tokens.text-secondary;
+            // Right-hand region: the mode label ("NORMAL" / "FILTER:
+            // <query>", built in Rust) when the filter box is closed, or
+            // the live editable box itself while it's open — never both at
+            // once, and never a popup/modal/toolbar/fourth region. A fixed
+            // width keeps this anchored to the right edge the same way the
+            // single `Text` it replaces always was.
+            Rectangle {
                 x: parent.width - self.width - 10px;
-                vertical-alignment: center;
+                y: 0px;
+                height: parent.height;
+                width: 340px;
+
+                // `filter-input` (below) must always be instantiated —
+                // never behind an `if` — because `focus-filter-input()`
+                // (a `public function` at the root) needs to resolve its
+                // id at every call, including the very first `/` of a
+                // session, which happens in the same tick as setting
+                // `filter-editing: true`; a conditionally-instantiated
+                // element's id is not resolvable from outside its own
+                // `if` (confirmed against Slint 1.17.1 directly: the
+                // compiler rejects it with "Cannot access id"). So every
+                // element in this region is unconditionally present and
+                // toggled with plain `visible:` instead — mode label and
+                // "FILTER" label are never both visible at once, and
+                // `filter-input` only overlaps the "FILTER" label's own
+                // slot for the very short label its text starts after.
+                Text {
+                    x: 0px;
+                    text: root.mode-text;
+                    color: Tokens.text-secondary;
+                    vertical-alignment: center;
+                    visible: !root.filter-editing;
+                }
+                Text {
+                    x: 0px;
+                    text: "FILTER";
+                    color: Tokens.text-secondary;
+                    vertical-alignment: center;
+                    visible: root.filter-editing;
+                }
+                // Bare `TextInput`, not `LineEdit`: M5V removed
+                // `StandardListView` specifically because a styled
+                // std-widget brought its own visual behavior that ignored
+                // xdir's tokens/font — the same reasoning applies here, so
+                // this is the lowest primitive Slint offers that still
+                // gives real text editing (cursor, Backspace, Unicode
+                // composition, focus) with zero toolkit chrome to fight.
+                // Colors/font come from `Tokens`/the window's own
+                // `default-font-family` (inherited, never re-set here),
+                // exactly like every other `Text` in this file.
+                filter-input := TextInput {
+                    x: 55px;
+                    y: 0px;
+                    height: parent.height;
+                    width: parent.width - self.x;
+                    visible: root.filter-editing;
+                    text <=> root.filter-query;
+                    single-line: true;
+                    color: Tokens.text-primary;
+                    vertical-alignment: center;
+                    edited => { root.filter-edited(self.text); }
+                    accepted => { root.filter-accepted(); }
+                    // Escape is the one key this box must not just insert
+                    // or ignore: intercepting it here (returning `accept`)
+                    // is what lets FILTER own it instead of it falling
+                    // through to `TextInput`'s own built-in handling
+                    // (which has no notion of "cancel"). Enter is
+                    // deliberately left to fall through (`reject`) so
+                    // `TextInput`'s own `single-line` handling fires its
+                    // built-in `accepted` callback above, the same path
+                    // any other single-line `TextInput` commit takes.
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.filter-escaped();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
             }
         }
     }

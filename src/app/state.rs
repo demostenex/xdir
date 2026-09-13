@@ -47,10 +47,27 @@ impl Update {
 
 /// Toolkit-agnostic application state. This is the source of truth; any UI
 /// model (a Slint `ModelRc`, or anything else) is only a projection of it.
+///
+/// `entries` is always the *full*, unfiltered directory listing — FILTER
+/// (M5T-A) never discards or rebuilds it, never re-reads the directory, and
+/// never rebuilds a `FileEntry` from a string. `selected`, likewise, always
+/// indexes `entries` (the full list), which is what lets a real path stay
+/// identified across a filter query changing, being cleared, or `entries`
+/// itself being reloaded (`toggle_hidden`) — exactly the same "by real path,
+/// never by index or displayed text" discipline `toggle_hidden` already
+/// used before FILTER existed. `filter_query` is presentation-layer state
+/// only: an empty string means "no filter", and CURRENT's visible subset —
+/// [`Self::visible_entries`]/[`Self::visible_selected_index`] — is derived
+/// from `(entries, filter_query)` on demand, never cached or stored
+/// separately. Public callers that pre-date FILTER (`entries()`,
+/// `selected()`) keep returning the full list/full index unchanged; only
+/// the UI's CURRENT-pane sync (`ui/window.rs`) reads the `visible_*`
+/// projection.
 pub struct AppState {
     navigation: Navigation,
     entries: Vec<FileEntry>,
     selected: Option<usize>,
+    filter_query: String,
     parent: ParentContext,
     preview: PreviewContext,
     places: Vec<Place>,
@@ -82,6 +99,7 @@ impl AppState {
             navigation,
             entries,
             selected,
+            filter_query: String::new(),
             parent,
             preview,
             places,
@@ -108,6 +126,64 @@ impl AppState {
         self.navigation.show_hidden()
     }
 
+    /// FILTER's active query. Empty means no filter is active — never a
+    /// distinct state from "no filter", by design (see `dispatch`'s
+    /// `ClearFilter` arm and [`Self::visible_indices`]).
+    pub fn filter_query(&self) -> &str {
+        &self.filter_query
+    }
+
+    /// The subset of `entries()` that FILTER's current query lets through,
+    /// in the same relative order — substring match is never a reorder or
+    /// a rank. Identical to `entries()` when no filter is active. This is
+    /// what `ui/window.rs` binds CURRENT's row model to; it is always
+    /// recomputed from `(entries, filter_query)`, never cached.
+    pub fn visible_entries(&self) -> Vec<&FileEntry> {
+        self.visible_indices()
+            .into_iter()
+            .map(|i| &self.entries[i])
+            .collect()
+    }
+
+    /// `selected`'s position within [`Self::visible_entries`] — what
+    /// `ui/window.rs` sets CURRENT's `current-index` to, and what a click
+    /// index (reported against that same visible list) is interpreted
+    /// against on the way back in. `None` both when nothing is selected and
+    /// when the selected entry, for whatever reason, isn't currently
+    /// visible (never the case after a `dispatch` returns, per
+    /// [`Self::sync_selection_to_filter`], but this stays a lookup rather
+    /// than a stored value so it can never drift out of sync with it).
+    pub fn visible_selected_index(&self) -> Option<usize> {
+        let selected = self.selected?;
+        self.visible_indices().iter().position(|&i| i == selected)
+    }
+
+    /// Full-list indices whose entry currently matches `filter_query` —
+    /// every index, in order, when the query is empty. Case-insensitive
+    /// substring match against the entry's display name
+    /// (`FileEntry::name()` lossily converted, the exact same presentation
+    /// text `ui/window.rs::row_label` shows) — never the `Path`/`OsString`
+    /// identity itself, and never a filesystem read: this only ever looks
+    /// at `entries`, which is already loaded.
+    fn visible_indices(&self) -> Vec<usize> {
+        if self.filter_query.is_empty() {
+            return (0..self.entries.len()).collect();
+        }
+        let query = self.filter_query.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry
+                    .name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     pub fn parent(&self) -> &ParentContext {
         &self.parent
     }
@@ -127,7 +203,11 @@ impl AppState {
             Action::SelectLast => self.select_last(),
             Action::ActivateSelected => self.activate_selected(),
             Action::ActivateIndex(index) => {
-                if index >= self.entries.len() {
+                // `index` is a position in the currently *visible*
+                // (filtered) list — exactly what a click reports it
+                // against, since that's the list CURRENT renders. Equal to
+                // a full-list index whenever no filter is active.
+                if index >= self.visible_indices().len() {
                     // A no-op `select_index` still leaves `self.selected`
                     // pointing at whatever was selected before — and
                     // `activate_selected` acts on `self.selected`, not on
@@ -144,20 +224,31 @@ impl AppState {
             Action::GoParent => self.go_parent(),
             Action::GoSystemPlace(kind) => self.go_system_place(kind),
             Action::ToggleHidden => self.toggle_hidden(),
+            Action::SetFilterQuery(query) => self.set_filter_query(query),
+            Action::ClearFilter => self.clear_filter(),
         }
     }
 
-    /// Clamped move by `delta`. A no-op when it doesn't actually change the
-    /// selection (e.g. already on the last entry and moving further down)
-    /// reports `Update::NONE` rather than `PREVIEW_ONLY`: nothing changed,
-    /// so nothing should be re-read.
+    /// Clamped move by `delta`, entirely within the currently *visible*
+    /// (filtered) ordering — `j`/`k`/arrows never land on a filtered-out
+    /// entry. Identical to a plain full-list move when no filter is
+    /// active. A no-op when it doesn't actually change the selection (e.g.
+    /// already on the last visible entry and moving further down) reports
+    /// `Update::NONE` rather than `PREVIEW_ONLY`: nothing changed, so
+    /// nothing should be re-read.
     fn select_by(&mut self, delta: i32) -> Update {
-        if self.entries.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             return Update::NONE;
         }
-        let last = self.entries.len() as i32 - 1;
-        let current = self.selected.map(|i| i as i32).unwrap_or(-1);
-        let next = (current + delta).clamp(0, last) as usize;
+        let current_pos = self
+            .selected
+            .and_then(|i| visible.iter().position(|&v| v == i))
+            .map(|p| p as i32)
+            .unwrap_or(-1);
+        let last = visible.len() as i32 - 1;
+        let next_pos = (current_pos + delta).clamp(0, last) as usize;
+        let next = visible[next_pos];
         if self.selected == Some(next) {
             return Update::NONE;
         }
@@ -166,43 +257,50 @@ impl AppState {
         Update::PREVIEW_ONLY
     }
 
-    /// Selects `index` directly. A no-op both for an out-of-range index and
-    /// for re-selecting the entry that's already selected — the latter
-    /// matters because the UI layer's own selection-sync (`sync_selection`)
-    /// round-trips through Slint's `current-item-changed` back into this
-    /// same call with the index it was just told to set; without this
-    /// check that round-trip would rebuild PREVIEW a second time for
-    /// nothing.
-    fn select_index(&mut self, index: usize) -> Update {
-        if index >= self.entries.len() {
+    /// Selects the entry at `visible_index`, a position in the currently
+    /// *visible* (filtered) list — exactly what a click reports it
+    /// against, and what `select_first`/`select_last` pass in. Equal to a
+    /// full-list index whenever no filter is active. A no-op both for an
+    /// out-of-range index and for re-selecting the entry that's already
+    /// selected — the latter matters because the UI layer's own
+    /// selection-sync (`sync_selection`) round-trips through Slint's
+    /// `current-item-changed` back into this same call with the index it
+    /// was just told to set; without this check that round-trip would
+    /// rebuild PREVIEW a second time for nothing.
+    fn select_index(&mut self, visible_index: usize) -> Update {
+        let visible = self.visible_indices();
+        let Some(&full_index) = visible.get(visible_index) else {
+            return Update::NONE;
+        };
+        if self.selected == Some(full_index) {
             return Update::NONE;
         }
-        if self.selected == Some(index) {
-            return Update::NONE;
-        }
-        self.selected = Some(index);
+        self.selected = Some(full_index);
         self.refresh_preview();
         Update::PREVIEW_ONLY
     }
 
-    /// Selects the first entry (`gg`). A no-op — `Update::NONE`, no preview
-    /// rebuild — both when CURRENT is empty and when the first entry is
-    /// already selected, via the same re-selection guard as [`Self::select_index`].
+    /// Selects the first *visible* entry (`gg`). A no-op — `Update::NONE`,
+    /// no preview rebuild — both when nothing is currently visible and when
+    /// the first visible entry is already selected, via the same
+    /// re-selection guard as [`Self::select_index`].
     fn select_first(&mut self) -> Update {
-        if self.entries.is_empty() {
+        if self.visible_indices().is_empty() {
             Update::NONE
         } else {
             self.select_index(0)
         }
     }
 
-    /// Selects the last entry (`G`). Same no-op guarantees as
-    /// [`Self::select_first`], mirrored for the other end of the list.
+    /// Selects the last *visible* entry (`G`). Same no-op guarantees as
+    /// [`Self::select_first`], mirrored for the other end of the visible
+    /// list.
     fn select_last(&mut self) -> Update {
-        if self.entries.is_empty() {
+        let visible_len = self.visible_indices().len();
+        if visible_len == 0 {
             Update::NONE
         } else {
-            self.select_index(self.entries.len() - 1)
+            self.select_index(visible_len - 1)
         }
     }
 
@@ -257,9 +355,17 @@ impl AppState {
         }
     }
 
+    /// Reloads the listing for a directory that actually changed —
+    /// `activate_selected`/`go_parent`/`go_system_place` all call this only
+    /// after `Navigation` confirms the target really is a new
+    /// `current_dir`, never on a failed or same-directory navigation
+    /// (those return `Update::NONE` before ever reaching here). FILTER is
+    /// scoped to one directory's listing, so it's cleared unconditionally
+    /// here: a new directory never inherits the previous one's query.
     fn reload(&mut self) {
         self.entries = self.navigation.entries().unwrap_or_default();
         self.selected = initial_selection(&self.entries);
+        self.filter_query.clear();
         self.refresh_contexts();
     }
 
@@ -287,9 +393,115 @@ impl AppState {
                     .position(|entry| entry.path() == path.as_path())
             })
             .or_else(|| initial_selection(&self.entries));
+        // `.` never touches `current_dir`, so — unlike `reload` — FILTER's
+        // query is kept exactly as-is and simply reapplied over the
+        // refreshed `entries`. The path-preserving pick above can still
+        // land on an entry the active query filters out (e.g. a dotfile
+        // that just became visible again but doesn't match); this clamps
+        // it to the first still-visible entry instead, same as any other
+        // filter-visibility change.
+        self.clamp_selection_to_filter();
 
         self.refresh_contexts();
         Update::ALL
+    }
+
+    /// The one rule for "does `selected` still make sense against the
+    /// current filter", shared by every place that needs to re-settle it: a
+    /// query edit ([`Self::sync_selection_to_filter`]), a query being
+    /// cleared ([`Self::clear_filter`] — clearing is really just "filter
+    /// changed to empty", so the exact same rule applies), and `entries`
+    /// itself changing under an unchanged query
+    /// ([`Self::clamp_selection_to_filter`], from `toggle_hidden`).
+    ///
+    /// "Still visible" and "no selection at all" are treated as exactly the
+    /// same case on purpose — both mean "nothing to preserve" — which is
+    /// the fix for a V1 bug: `clamp_selection_to_filter` used to skip doing
+    /// anything at all when `selected` was already `None`, on the
+    /// unstated assumption that it could never be `None` there. It *can*:
+    /// `toggle_hidden`'s own upstream fallback happens to always land on
+    /// `Some` when `entries` isn't empty, which quietly worked around the
+    /// gap, but that made the gap invisible rather than closing it, one
+    /// call site relying on another's incidental behavior instead of its
+    /// own contract. Falling to `visible.first()` in both the "invisible"
+    /// and "unset" cases removes that hidden coupling — and is also
+    /// exactly the fix V1's `clear_filter` needed: clearing a zero-match
+    /// filter now lands on the first full entry (deterministic, no
+    /// selection-history state) instead of leaving `selected` stuck at
+    /// `None` with a non-empty listing behind it.
+    ///
+    /// Returns whether `selected` actually changed, so each caller reports
+    /// `preview_changed` precisely instead of always rebuilding it.
+    fn resettle_selection_to_filter(&mut self) -> bool {
+        let visible = self.visible_indices();
+        let still_visible = self.selected.is_some_and(|i| visible.contains(&i));
+        if still_visible {
+            return false;
+        }
+        let next = visible.first().copied();
+        let changed = next != self.selected;
+        self.selected = next;
+        changed
+    }
+
+    /// If `selected` no longer makes sense against the active filter —
+    /// invisible, or unset while a visible entry now exists (see
+    /// [`Self::resettle_selection_to_filter`]) — moves it to the first
+    /// visible entry, or to no selection if none are visible. A no-op
+    /// whenever `selected` is already visible — in particular always a
+    /// no-op when no filter is active, since every entry is then visible
+    /// by definition. `toggle_hidden` always rebuilds PREVIEW right after
+    /// this regardless (`refresh_contexts`, unconditional on `Update::ALL`),
+    /// so unlike its siblings below this doesn't need to report whether
+    /// selection changed.
+    fn clamp_selection_to_filter(&mut self) {
+        self.resettle_selection_to_filter();
+    }
+
+    /// Replaces FILTER's active query outright and re-derives selection
+    /// from it: the previously selected entry stays selected if the new
+    /// query still lets it through, otherwise selection falls to the first
+    /// still-visible entry, or to none if nothing matches (see
+    /// [`Self::resettle_selection_to_filter`]). Dispatched on every
+    /// keystroke while FILTER is being edited — the query already filters
+    /// CURRENT live, so committing (Enter) never needs to call back into
+    /// `AppState` at all.
+    fn set_filter_query(&mut self, query: String) -> Update {
+        self.filter_query = query;
+        let changed = self.resettle_selection_to_filter();
+        if changed {
+            self.refresh_preview();
+        }
+        Update {
+            current_changed: true,
+            parent_changed: false,
+            preview_changed: changed,
+        }
+    }
+
+    /// Clears FILTER's query back to empty. `selected` is preserved exactly
+    /// when it's already a real, visible entry (every entry is visible once
+    /// the query is empty, so this is a no-op whenever anything at all was
+    /// selected going in) — restored to the first full entry only in the
+    /// one case that has nothing to preserve: a zero-match query had
+    /// already reset `selected` to `None` (see
+    /// [`Self::resettle_selection_to_filter`]) while `entries` itself is
+    /// non-empty. No selection *history* is kept — this is the smallest
+    /// rule that never leaves a non-empty listing with nothing selected.
+    fn clear_filter(&mut self) -> Update {
+        if self.filter_query.is_empty() {
+            return Update::NONE;
+        }
+        self.filter_query.clear();
+        let changed = self.resettle_selection_to_filter();
+        if changed {
+            self.refresh_preview();
+        }
+        Update {
+            current_changed: true,
+            parent_changed: false,
+            preview_changed: changed,
+        }
     }
 
     /// Rebuilds both PARENT and PREVIEW. Used whenever `current_dir` or
@@ -419,6 +631,30 @@ mod tests {
         state.dispatch(Action::ActivateIndex(0));
 
         assert_eq!(state.current_dir(), dir.path().join("z_dir"));
+    }
+
+    /// M5T-A V2 audit's bug #1 ("GoParent em /"): the audit assumed
+    /// `Navigation::go_to_parent()` returns `io::Result<bool>` with
+    /// `Ok(false)` at the root, which `AppState::go_parent()`'s
+    /// `.is_ok()` check would then wrongly treat as success — reloading
+    /// (clearing FILTER) without `current_dir` actually changing. The real
+    /// signature is `io::Result<()>`, and at the root it returns `Err(_)`
+    /// (`src/core/navigation.rs::go_to_parent`, "current directory has no
+    /// parent"), which `.is_ok()` already reports as failure — so
+    /// `go_parent` already takes the `Update::NONE` branch and never calls
+    /// `reload()`. This test is kept exactly as the audit specified,
+    /// passing unmodified: xdir being Linux-only makes `/` a real,
+    /// deterministic parent-less directory to prove it against directly.
+    #[test]
+    fn go_parent_at_root_keeps_filter() {
+        let mut state = test_state(Navigation::new(std::path::PathBuf::from("/")).unwrap());
+        state.dispatch(Action::SetFilterQuery("x".to_string()));
+
+        let update = state.dispatch(Action::GoParent);
+
+        assert_eq!(update, Update::NONE, "update was {update:?}");
+        assert_eq!(state.current_dir(), std::path::Path::new("/"));
+        assert_eq!(state.filter_query(), "x");
     }
 
     #[test]
@@ -983,5 +1219,442 @@ mod tests {
             PreviewContext::Directory(children) => assert!(children.is_empty()),
             other => panic!("expected Directory preview for inner, got {other:?}"),
         }
+    }
+
+    // --- FILTER (M5T-A) --------------------------------------------------
+
+    /// Four files whose names deliberately share/don't-share the substring
+    /// "cargo", case varied on purpose (`filter_is_case_insensitive`).
+    /// Byte-order sort (`core::filesystem::sort_entries`) puts them in
+    /// exactly this order: uppercase `C` (0x43) sorts before lowercase
+    /// `c`/`m`/`r`.
+    fn filter_fixture_dir() -> TempDir {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("Cargo.toml"), b"").unwrap();
+        fs::write(dir.path().join("cargo.lock"), b"").unwrap();
+        fs::write(dir.path().join("my-cargo-notes.txt"), b"").unwrap();
+        fs::write(dir.path().join("readme.md"), b"").unwrap();
+        dir
+    }
+
+    fn filter_state() -> (TempDir, AppState) {
+        let dir = filter_fixture_dir();
+        let state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        (dir, state)
+    }
+
+    fn visible_names(state: &AppState) -> Vec<String> {
+        state
+            .visible_entries()
+            .iter()
+            .map(|e| e.name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn empty_query_shows_all_entries() {
+        let (_dir, state) = filter_state();
+
+        assert_eq!(state.filter_query(), "");
+        assert_eq!(visible_names(&state), names(&state));
+    }
+
+    #[test]
+    fn filter_matches_substring() {
+        let (_dir, mut state) = filter_state();
+
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        assert_eq!(
+            visible_names(&state),
+            vec!["Cargo.toml", "cargo.lock", "my-cargo-notes.txt"]
+        );
+    }
+
+    #[test]
+    fn filter_is_case_insensitive() {
+        let (_dir, mut state) = filter_state();
+
+        state.dispatch(Action::SetFilterQuery("CARGO".to_string()));
+
+        assert_eq!(
+            visible_names(&state),
+            vec!["Cargo.toml", "cargo.lock", "my-cargo-notes.txt"]
+        );
+    }
+
+    #[test]
+    fn filter_no_match_returns_empty_visible_list() {
+        let (_dir, mut state) = filter_state();
+
+        state.dispatch(Action::SetFilterQuery("zzz-no-match".to_string()));
+
+        assert!(state.visible_entries().is_empty());
+    }
+
+    #[test]
+    fn filter_does_not_mutate_full_entries() {
+        let (_dir, mut state) = filter_state();
+        let before = names(&state);
+
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        // `entries()` (the full list) is untouched by filtering — only
+        // `visible_entries()` is a subset.
+        assert_eq!(names(&state), before);
+    }
+
+    #[test]
+    fn selected_path_is_preserved_when_still_visible() {
+        let (_dir, mut state) = filter_state();
+        let selected_path = state.selected_entry().unwrap().path().to_path_buf();
+        assert_eq!(
+            selected_path.file_name().unwrap(),
+            std::ffi::OsStr::new("Cargo.toml")
+        );
+
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        assert_eq!(
+            state.selected_entry().unwrap().path(),
+            selected_path.as_path()
+        );
+    }
+
+    #[test]
+    fn selected_path_falls_to_first_result_when_filtered_out() {
+        let (_dir, mut state) = filter_state();
+        state.dispatch(Action::SelectLast); // "readme.md" — "cargo" excludes it
+        assert_eq!(
+            state.selected_entry().unwrap().name(),
+            std::ffi::OsStr::new("readme.md")
+        );
+
+        let update = state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        assert_eq!(
+            state.selected_entry().unwrap().name(),
+            std::ffi::OsStr::new("Cargo.toml")
+        );
+        assert!(update.preview_changed);
+    }
+
+    #[test]
+    fn no_results_clear_selection() {
+        let (_dir, mut state) = filter_state();
+
+        state.dispatch(Action::SetFilterQuery("zzz-no-match".to_string()));
+
+        assert!(state.selected_entry().is_none());
+        assert_eq!(state.visible_selected_index(), None);
+    }
+
+    /// M5T-A V2 audit's bug #2: V1's `clear_filter` left `selected` at
+    /// `None` after a zero-match query, even with a non-empty full listing
+    /// right behind it. Fixed via `resettle_selection_to_filter` — no
+    /// selection-history state, deterministically the first full entry.
+    #[test]
+    fn clear_filter_after_zero_matches_restores_selection() {
+        let (_dir, mut state) = filter_state();
+        state.dispatch(Action::SetFilterQuery("zzz-no-match".to_string()));
+        assert!(state.selected_entry().is_none());
+        assert!(matches!(state.preview(), PreviewContext::None));
+
+        let update = state.dispatch(Action::ClearFilter);
+
+        // Full listing back, a real entry selected, PREVIEW matching it.
+        assert_eq!(visible_names(&state), names(&state));
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("Cargo.toml"))
+        );
+        assert!(
+            !matches!(state.preview(), PreviewContext::None),
+            "PREVIEW must follow the restored selection, not stay empty"
+        );
+        assert!(update.current_changed);
+        assert!(!update.parent_changed);
+        assert!(update.preview_changed);
+    }
+
+    #[test]
+    fn clearing_filter_restores_full_entries() {
+        let (_dir, mut state) = filter_state();
+        let full = names(&state);
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+        assert_ne!(visible_names(&state), full);
+
+        state.dispatch(Action::ClearFilter);
+
+        assert_eq!(visible_names(&state), full);
+        assert_eq!(state.filter_query(), "");
+    }
+
+    #[test]
+    fn clearing_filter_preserves_real_selected_path_when_possible() {
+        let (_dir, mut state) = filter_state();
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+        let selected_path = state.selected_entry().unwrap().path().to_path_buf();
+
+        state.dispatch(Action::ClearFilter);
+
+        assert_eq!(
+            state.selected_entry().unwrap().path(),
+            selected_path.as_path()
+        );
+    }
+
+    #[test]
+    fn filtering_does_not_change_current_dir() {
+        let (_dir, mut state) = filter_state();
+        let dir_before = state.current_dir().to_path_buf();
+
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        assert_eq!(state.current_dir(), dir_before.as_path());
+    }
+
+    #[test]
+    fn filtering_does_not_rebuild_parent() {
+        let (_dir, mut state) = filter_state();
+
+        let update = state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        assert!(!update.parent_changed);
+    }
+
+    #[test]
+    fn preview_unchanged_when_selected_path_stays_same() {
+        let (_dir, mut state) = filter_state();
+        // "Cargo.toml" is selected initially and still matches "cargo".
+
+        let update = state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        assert!(!update.preview_changed);
+    }
+
+    #[test]
+    fn preview_changes_once_when_filter_changes_selection() {
+        let (_dir, mut state) = filter_state();
+        state.dispatch(Action::SelectLast); // "readme.md"
+
+        let update = state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+        assert!(update.preview_changed);
+        let preview_after = format!("{:?}", state.preview());
+
+        // Narrowing further, while the same entry ("Cargo.toml") stays the
+        // best/first match, must not rebuild PREVIEW a second time.
+        let update2 = state.dispatch(Action::SetFilterQuery("cargo.".to_string()));
+        assert!(!update2.preview_changed);
+        assert_eq!(format!("{:?}", state.preview()), preview_after);
+    }
+
+    #[test]
+    fn toggle_hidden_keeps_active_query() {
+        let (_dir, mut state) = filter_state();
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        state.dispatch(Action::ToggleHidden);
+
+        assert_eq!(state.filter_query(), "cargo");
+    }
+
+    /// M5T-A V2 audit's bug #3: `clamp_selection_to_filter` skipped doing
+    /// anything whenever `selected` was already `None`. In V1 that gap was
+    /// unreachable in practice — `toggle_hidden`'s own path-preserving pick
+    /// already falls back to `initial_selection` (the first *full* entry)
+    /// whenever `entries` isn't empty, so `clamp_selection_to_filter` never
+    /// actually saw `None` with a non-empty listing behind it — but that
+    /// made the gap invisible rather than real, one call site's behavior
+    /// quietly covering for another's incomplete one. `resettle_selection_
+    /// to_filter` (shared with `set_filter_query`/`clear_filter`) treats
+    /// "unset" and "invisible" identically, closing the gap in the rule
+    /// itself rather than relying on an upstream coincidence.
+    #[test]
+    fn toggle_hidden_can_restore_selection_when_filter_gains_results() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".cargo-hidden"), b"").unwrap();
+        fs::write(dir.path().join("readme.md"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery(".cargo".to_string()));
+        assert!(state.visible_entries().is_empty());
+        assert!(state.selected_entry().is_none(), "expected no selection");
+
+        state.dispatch(Action::ToggleHidden);
+
+        assert_eq!(
+            state.selected_entry().map(|e| e.name().to_owned()),
+            Some(std::ffi::OsString::from(".cargo-hidden"))
+        );
+        assert!(
+            !matches!(state.preview(), PreviewContext::None),
+            "PREVIEW must follow the newly-visible selection"
+        );
+    }
+
+    /// The inverse path: a matching, selected entry that `ToggleHidden`
+    /// itself hides again must leave FILTER with zero visible results and
+    /// no selection — never a stale index pointing at an entry CURRENT no
+    /// longer shows.
+    #[test]
+    fn toggle_hidden_can_clear_selection_when_filter_loses_its_match() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".cargo-hidden"), b"").unwrap();
+        fs::write(dir.path().join("readme.md"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::ToggleHidden); // show hidden: ".cargo-hidden" visible
+        state.dispatch(Action::SetFilterQuery(".cargo".to_string()));
+        assert_eq!(
+            state.selected_entry().map(|e| e.name().to_owned()),
+            Some(std::ffi::OsString::from(".cargo-hidden"))
+        );
+
+        state.dispatch(Action::ToggleHidden); // hide it again
+
+        assert!(state.visible_entries().is_empty());
+        assert!(state.selected_entry().is_none());
+        assert!(matches!(state.preview(), PreviewContext::None));
+    }
+
+    #[test]
+    fn toggle_hidden_reapplies_filter() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".cargo-hidden"), b"").unwrap();
+        fs::write(dir.path().join("cargo.lock"), b"").unwrap();
+        fs::write(dir.path().join("readme.md"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+        assert_eq!(visible_names(&state), vec!["cargo.lock"]);
+
+        state.dispatch(Action::ToggleHidden); // reveals dotfiles
+
+        // The newly revealed ".cargo-hidden" also matches "cargo" and must
+        // show up in the reapplied filter — with no directory read beyond
+        // the single one `ToggleHidden` already does.
+        assert_eq!(visible_names(&state), vec![".cargo-hidden", "cargo.lock"]);
+    }
+
+    #[test]
+    fn successful_directory_navigation_clears_filter() {
+        let dir = TempDir::new();
+        fs::create_dir(dir.path().join("cargo-project")).unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+        assert_eq!(state.filter_query(), "cargo");
+
+        state.dispatch(Action::ActivateSelected); // enters "cargo-project"
+
+        assert_eq!(state.filter_query(), "");
+    }
+
+    #[test]
+    fn failed_navigation_keeps_filter() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("cargo-file.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        // The only (filtered-in) entry is a regular file: `ActivateSelected`
+        // is a deliberate no-op, exactly as it was before FILTER existed.
+        let update = state.dispatch(Action::ActivateSelected);
+
+        assert_eq!(update, Update::NONE);
+        assert_eq!(state.filter_query(), "cargo");
+    }
+
+    #[test]
+    fn same_directory_noop_keeps_filter() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, start.clone())];
+        let mut state = state_with_places(start, places);
+        state.dispatch(Action::SetFilterQuery("x".to_string()));
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(update, Update::NONE);
+        assert_eq!(state.filter_query(), "x");
+    }
+
+    #[test]
+    fn go_system_place_success_clears_filter() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let home = place_dir(&root, "home");
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, home.clone())];
+        let mut state = state_with_places(start, places);
+        state.dispatch(Action::SetFilterQuery("x".to_string()));
+
+        state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(state.filter_query(), "");
+    }
+
+    /// §27: an accented query must match an accented filename by plain
+    /// `str::to_lowercase` substring containment — no NFC/NFD
+    /// normalization required this milestone, just a real non-ASCII
+    /// character surviving the whole path unmangled.
+    #[test]
+    fn filter_matches_accented_substring_case_insensitively() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("documentação.txt"), b"").unwrap();
+        fs::write(dir.path().join("plain.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        state.dispatch(Action::SetFilterQuery("AÇÃO".to_string()));
+
+        assert_eq!(visible_names(&state), vec!["documentação.txt"]);
+    }
+
+    /// Enter's "commit" (see `ui/window.rs::on_filter_accepted`) makes no
+    /// further `AppState` call — the query already filters CURRENT live as
+    /// it's typed, so this documents the invariant that makes that
+    /// correct: once `SetFilterQuery` is dispatched, FILTER is already
+    /// exactly as "committed" as pressing Enter would ever make it.
+    #[test]
+    fn enter_commits_filter_and_returns_normal() {
+        let (_dir, mut state) = filter_state();
+
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        assert_eq!(state.filter_query(), "cargo");
+        assert_eq!(
+            visible_names(&state),
+            vec!["Cargo.toml", "cargo.lock", "my-cargo-notes.txt"]
+        );
+    }
+
+    #[test]
+    fn escape_from_filter_clears_and_returns_normal() {
+        let (_dir, mut state) = filter_state();
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        state.dispatch(Action::ClearFilter);
+
+        assert_eq!(state.filter_query(), "");
+        assert_eq!(visible_names(&state), names(&state));
+    }
+
+    #[test]
+    fn normal_without_filter_escape_is_noop() {
+        let (_dir, mut state) = filter_state();
+        assert_eq!(state.filter_query(), "");
+
+        let update = state.dispatch(Action::ClearFilter);
+
+        assert_eq!(update, Update::NONE);
+    }
+
+    /// What `ui/window.rs::begin_filter_edit` pre-fills the input box with
+    /// on a second `/` (§8, "reabrir `/`") — the query must survive an
+    /// unrelated action (a plain selection move) untouched.
+    #[test]
+    fn reopening_filter_preloads_the_active_query() {
+        let (_dir, mut state) = filter_state();
+        state.dispatch(Action::SetFilterQuery("cargo".to_string()));
+
+        state.dispatch(Action::SelectNext);
+
+        assert_eq!(state.filter_query(), "cargo");
     }
 }

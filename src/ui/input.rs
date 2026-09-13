@@ -163,7 +163,11 @@ enum KeymapState {
 
 /// What resolving one [`KeyStroke`] against the current [`KeymapState`]
 /// produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy` as of the FILTER foundation (M5T-A): `Action` itself
+/// stopped being `Copy` (its new `SetFilterQuery` variant carries an owned
+/// `String`), so this, which wraps `Action`, follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeymapResult {
     /// A complete command: dispatch this action.
     Action(Action),
@@ -177,6 +181,13 @@ pub(crate) enum KeymapResult {
     /// `Normal`. The stroke that cancelled it is never reinterpreted as a
     /// fresh `Normal`-mode keystroke.
     Cancelled,
+    /// `/` in `Normal`: not an `Action` (nothing about `AppState` changes
+    /// by opening the box — the query is whatever it already was), just a
+    /// signal for `ui/window.rs` to show FILTER's input and move keyboard
+    /// focus to it. Never produced from `PendingGo` — see
+    /// [`Keymap::resolve_pending_go`]'s catch-all, which cancels the
+    /// pending prefix instead, exactly like any other invalid continuation.
+    EnterFilter,
     /// This keystroke means nothing to xdir at all (an unbound key, or one
     /// carrying a modifier xdir never claims) — left alone for the window
     /// manager or ignored outright.
@@ -236,6 +247,22 @@ impl Keymap {
                 self.state = KeymapState::PendingGo;
                 KeymapResult::Pending
             }
+            // Opens (or, if a query is already active, reopens) FILTER's
+            // input — see `KeymapResult::EnterFilter`. Never reachable from
+            // `PendingGo`: `resolve_pending_go` has no `/` arm of its own,
+            // so `g /` falls into its catch-all and cancels the pending
+            // `g` instead, exactly per the milestone's frozen rule that an
+            // invalid continuation is never reinterpreted as a fresh
+            // `Normal`-mode keystroke.
+            Key::Char('/') => KeymapResult::EnterFilter,
+            // `Esc` in `Normal`: clears an active filter, or does nothing
+            // if none is active — always consumed either way, the same way
+            // every other bound key here is, whether or not it actually
+            // changes anything (compare `SelectNext` already at the last
+            // entry, also always consumed). `AppState::dispatch`'s
+            // `ClearFilter` arm is what makes the no-filter case a true
+            // no-op (`Update::NONE`).
+            Key::Escape => KeymapResult::Action(Action::ClearFilter),
             _ => KeymapResult::Unhandled,
         }
     }
@@ -681,7 +708,9 @@ mod tests {
 
     #[test]
     fn reserved_future_keys_remain_unimplemented() {
-        for raw in ["/", "f", "a", "r", "y", "x", "p", "d", " "] {
+        // `/` was reserved here through M5V; M5T-A (FILTER) implements it
+        // — see `slash_enters_filter_mode` — so it moved out of this list.
+        for raw in ["f", "a", "r", "y", "x", "p", "d", " "] {
             let mut keymap = Keymap::new();
             assert_eq!(
                 keymap.resolve(plain(raw)),
@@ -689,5 +718,40 @@ mod tests {
                 "key {raw:?} must remain unbound in Normal mode this milestone"
             );
         }
+    }
+
+    // --- FILTER (M5T-A) ---------------------------------------------------
+
+    #[test]
+    fn slash_enters_filter_mode() {
+        assert_eq!(resolve_once("/"), KeymapResult::EnterFilter);
+    }
+
+    #[test]
+    fn slash_during_pending_go_only_cancels_prefix() {
+        let mut keymap = Keymap::new();
+        keymap.resolve(plain("g"));
+
+        // `/` is not a valid continuation of `g`: the whole `g /` sequence
+        // cancels, exactly like any other invalid continuation — it must
+        // never itself open FILTER on this same keystroke.
+        assert_eq!(keymap.resolve(plain("/")), KeymapResult::Cancelled);
+
+        // The *next*, fresh `/` (Normal again, no pending prefix) does open
+        // FILTER — the cancelled one was never silently reinterpreted.
+        assert_eq!(keymap.resolve(plain("/")), KeymapResult::EnterFilter);
+    }
+
+    #[test]
+    fn escape_in_normal_resolves_to_clear_filter_action() {
+        // The Keymap layer never knows whether a filter is actually
+        // active — that's `AppState::dispatch`'s `ClearFilter` arm's job
+        // (see its own tests: `normal_without_filter_escape_is_noop` there
+        // confirms the no-filter case is a true no-op). This only confirms
+        // what Keymap itself resolves bare `Esc` to in `Normal`.
+        assert_eq!(
+            resolve_once("Escape"),
+            KeymapResult::Action(Action::ClearFilter)
+        );
     }
 }
