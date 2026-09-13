@@ -188,6 +188,13 @@ pub(crate) enum KeymapResult {
     /// [`Keymap::resolve_pending_go`]'s catch-all, which cancels the
     /// pending prefix instead, exactly like any other invalid continuation.
     EnterFilter,
+    /// `f` in `Normal` (M5T-B2): the FIND counterpart of `EnterFilter` —
+    /// same reasoning, same non-`Action` shape (opening the box changes
+    /// nothing in `AppState` either; only Enter, via `Action::StartFind`,
+    /// does), same `PendingGo` exclusion (`g f` only ever cancels the
+    /// pending `g`, via `resolve_pending_go`'s catch-all — never opens
+    /// FIND on that same keystroke).
+    EnterFind,
     /// This keystroke means nothing to xdir at all (an unbound key, or one
     /// carrying a modifier xdir never claims) — left alone for the window
     /// manager or ignored outright.
@@ -255,14 +262,21 @@ impl Keymap {
             // invalid continuation is never reinterpreted as a fresh
             // `Normal`-mode keystroke.
             Key::Char('/') => KeymapResult::EnterFilter,
-            // `Esc` in `Normal`: clears an active filter, or does nothing
-            // if none is active — always consumed either way, the same way
-            // every other bound key here is, whether or not it actually
-            // changes anything (compare `SelectNext` already at the last
-            // entry, also always consumed). `AppState::dispatch`'s
-            // `ClearFilter` arm is what makes the no-filter case a true
+            // Opens (or reopens, pre-filled with the committed query) FIND
+            // — see `KeymapResult::EnterFind`. Same `PendingGo` exclusion
+            // as `/`.
+            Key::Char('f') => KeymapResult::EnterFind,
+            // `Esc` in `Normal`: cancels whichever transient view is on
+            // top — FIND before FILTER, or does nothing if neither is
+            // active — always consumed either way, the same way every
+            // other bound key here is, whether or not it actually changes
+            // anything (compare `SelectNext` already at the last entry,
+            // also always consumed). `AppState::dispatch`'s
+            // `CancelCurrentView` arm (M5T-B2; folded in what used to be a
+            // direct `ClearFilter` here) is what resolves the FIND-over-
+            // FILTER priority and makes the "neither active" case a true
             // no-op (`Update::NONE`).
-            Key::Escape => KeymapResult::Action(Action::ClearFilter),
+            Key::Escape => KeymapResult::Action(Action::CancelCurrentView),
             _ => KeymapResult::Unhandled,
         }
     }
@@ -710,7 +724,9 @@ mod tests {
     fn reserved_future_keys_remain_unimplemented() {
         // `/` was reserved here through M5V; M5T-A (FILTER) implements it
         // — see `slash_enters_filter_mode` — so it moved out of this list.
-        for raw in ["f", "a", "r", "y", "x", "p", "d", " "] {
+        // `f` was reserved through M5T-A; M5T-B2 (FIND) implements it —
+        // see `f_enters_find_mode` — so it moves out too.
+        for raw in ["a", "r", "y", "x", "p", "d", " "] {
             let mut keymap = Keymap::new();
             assert_eq!(
                 keymap.resolve(plain(raw)),
@@ -743,15 +759,41 @@ mod tests {
     }
 
     #[test]
-    fn escape_in_normal_resolves_to_clear_filter_action() {
-        // The Keymap layer never knows whether a filter is actually
-        // active — that's `AppState::dispatch`'s `ClearFilter` arm's job
-        // (see its own tests: `normal_without_filter_escape_is_noop` there
-        // confirms the no-filter case is a true no-op). This only confirms
-        // what Keymap itself resolves bare `Esc` to in `Normal`.
+    fn escape_in_normal_resolves_to_cancel_current_view_action() {
+        // The Keymap layer never knows whether FIND or FILTER (or neither)
+        // is actually active — resolving FIND-over-FILTER priority, and
+        // making the "neither active" case a true no-op, is
+        // `AppState::dispatch`'s `CancelCurrentView` arm's job (see its own
+        // tests: `normal_without_filter_escape_is_noop` there confirms the
+        // no-transient-view case). This only confirms what Keymap itself
+        // resolves bare `Esc` to in `Normal` — the same one `Action`
+        // regardless (M5T-B2 replaced the direct `ClearFilter` this used to
+        // resolve to; see `Action::CancelCurrentView`'s own doc comment).
         assert_eq!(
             resolve_once("Escape"),
-            KeymapResult::Action(Action::ClearFilter)
+            KeymapResult::Action(Action::CancelCurrentView)
         );
+    }
+
+    // --- FIND (M5T-B2) -----------------------------------------------------
+
+    #[test]
+    fn f_enters_find_mode() {
+        assert_eq!(resolve_once("f"), KeymapResult::EnterFind);
+    }
+
+    #[test]
+    fn f_during_pending_go_only_cancels_prefix() {
+        let mut keymap = Keymap::new();
+        keymap.resolve(plain("g"));
+
+        // `f` is not a valid continuation of `g`: the whole `g f` sequence
+        // cancels, exactly like any other invalid continuation — it must
+        // never itself open FIND on this same keystroke.
+        assert_eq!(keymap.resolve(plain("f")), KeymapResult::Cancelled);
+
+        // The *next*, fresh `f` (Normal again, no pending prefix) does open
+        // FIND — the cancelled one was never silently reinterpreted.
+        assert_eq!(keymap.resolve(plain("f")), KeymapResult::EnterFind);
     }
 }

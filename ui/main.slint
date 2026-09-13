@@ -152,6 +152,28 @@ export component MainWindow inherits Window {
     callback filter-accepted();
     callback filter-escaped();
 
+    // FIND (M5T-B2): a real recursive filesystem search, semantically
+    // distinct from FILTER above — see `ui/window.rs`/`core::find`. Unlike
+    // `filter-query`, `find-query` is a pure UI *draft*: typing here never
+    // reaches `AppState` or touches the filesystem, only Enter
+    // (`find-accepted`) does, via `Action::StartFind`. There is
+    // deliberately no `find-edited` callback — nothing needs to happen on
+    // each keystroke, unlike FILTER's live-updating one. `find-editing`
+    // mirrors `filter-editing` exactly (pure UI-focus state); the two are
+    // never both `true` at once, by construction — see `find-input`'s own
+    // comment below for why that never needs an explicit guard.
+    in-out property <string> find-query: "";
+    in property <bool> find-editing: false;
+    callback find-accepted();
+    callback find-escaped();
+    // A worker thread never calls into `AppState` itself (it isn't
+    // `Send`-reachable from another thread at all — see
+    // `ui/window.rs::begin_find_search`'s doc comment) — it only wakes the
+    // UI thread via this callback, carrying no payload of its own, so Rust
+    // can drain the real completion off a plain `std::sync::mpsc` channel
+    // it already owns.
+    callback find-completion-ready();
+
     // UI never touches the filesystem or Navigation, and never decides
     // what a keystroke or click *means* — it only reports what happened.
     // `key-input` forwards the pressed key's raw text (or, for the arrow
@@ -204,6 +226,13 @@ export component MainWindow inherits Window {
     // would otherwise still be holding.
     public function focus-filter-input() {
         filter-input.focus();
+    }
+
+    // Mirrors `focus-filter-input()` for FIND's own box — see that
+    // function's own comment for why `find-input` must always be
+    // instantiated (never behind an `if`) for this to resolve its id.
+    public function focus-find-input() {
+        find-input.focus();
     }
 
     VerticalLayout {
@@ -639,7 +668,13 @@ export component MainWindow inherits Window {
                     text: root.mode-text;
                     color: Tokens.text-secondary;
                     vertical-alignment: center;
-                    visible: !root.filter-editing;
+                    // `mode-text` already carries FIND's own non-editing
+                    // states ("FIND: <query>" while Ready/Error, "FIND:
+                    // <query>" + `status-text` "searching..." while
+                    // Searching — see `ui/window.rs::full_refresh_current`)
+                    // exactly the same way it carries FILTER's, so this
+                    // only needs to hide while *either* box is open.
+                    visible: !root.filter-editing && !root.find-editing;
                 }
                 Text {
                     x: 0px;
@@ -647,6 +682,13 @@ export component MainWindow inherits Window {
                     color: Tokens.text-secondary;
                     vertical-alignment: center;
                     visible: root.filter-editing;
+                }
+                Text {
+                    x: 0px;
+                    text: "FIND";
+                    color: Tokens.text-secondary;
+                    vertical-alignment: center;
+                    visible: root.find-editing;
                 }
                 // Bare `TextInput`, not `LineEdit`: M5V removed
                 // `StandardListView` specifically because a styled
@@ -682,6 +724,38 @@ export component MainWindow inherits Window {
                     key-pressed(event) => {
                         if (event.text == Key.Escape) {
                             root.filter-escaped();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+                // FIND's own box: same primitive, same slot/geometry as
+                // `filter-input` (never both `visible` at once — opening
+                // either box requires keyboard focus to already be on
+                // `focus-scope`, which is exactly the one place `/` and `f`
+                // are recognized at all, so there is no keystroke sequence
+                // that could show both), same "always instantiated, never
+                // behind `if`" reasoning (`focus-find-input()` needs to
+                // resolve its id). No `edited` callback: unlike FILTER,
+                // nothing needs to run per keystroke here (see this
+                // component's own `find-query` doc comment) — `text <=>
+                // root.find-query` alone is enough for Rust to read the
+                // draft back at Enter time.
+                find-input := TextInput {
+                    x: 55px;
+                    y: 0px;
+                    height: parent.height;
+                    width: parent.width - self.x;
+                    visible: root.find-editing;
+                    text <=> root.find-query;
+                    single-line: true;
+                    color: Tokens.text-primary;
+                    vertical-alignment: center;
+                    accepted => { root.find-accepted(); }
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.find-escaped();
                             accept
                         } else {
                             reject

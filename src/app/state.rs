@@ -1,9 +1,18 @@
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::app::{Action, ParentContext, PreviewContext};
+use crate::core::find::FindOutcome;
 use crate::core::navigation::Navigation;
 use crate::core::places::{self, Place, SystemPlaceKind};
-use crate::model::FileEntry;
+use crate::model::{EntryKind, FileEntry};
+
+/// Upper bound this milestone's UI places on a single FIND search — chosen
+/// here (the `app`/runtime layer), never inside `core::find`, which
+/// deliberately has no opinion of its own about how many results a caller
+/// wants (see the M5T-B1 decision note). Not configurable yet; a future
+/// milestone's concern.
+pub const FIND_MAX_RESULTS: usize = 500;
 
 /// What a `dispatch` call actually changed, so the UI layer never has to
 /// infer that by diffing entry counts or any other derived signal —
@@ -45,6 +54,99 @@ impl Update {
     }
 }
 
+/// FIND's result set once a search completes successfully. A deliberately
+/// small, flat snapshot — never re-derived, never re-sorted (`core::find`
+/// already returns it in the milestone's frozen deterministic order) —
+/// holding exactly what CURRENT/PREVIEW need to render it.
+#[derive(Debug, Clone)]
+pub struct FindReady {
+    /// Real `FileEntry` values straight from `core::find::FindOutcome` —
+    /// never rebuilt from a string, never copied into a parallel DTO.
+    pub results: Vec<FileEntry>,
+    /// Index into `results`, FIND's *own* selection — entirely separate
+    /// from `AppState::selected` (the normal directory's selection), which
+    /// this never reads or writes. `None` only when `results` is empty.
+    pub selected: Option<usize>,
+    /// Mirrors `FindOutcome::truncated`: `true` means the search stopped
+    /// because it hit `FIND_MAX_RESULTS`, not that another match was ever
+    /// proven to exist beyond it.
+    pub truncated: bool,
+    /// `FindOutcome::skipped_errors.len()` — a count, not the paths
+    /// themselves: enough for the status line ("N results · K skipped")
+    /// without carrying a `Vec<PathBuf>` nobody in this milestone's UI
+    /// reads further.
+    pub skipped_count: usize,
+}
+
+/// What a `FindSession` is currently doing. Kept as three plain variants —
+/// not a `results: Vec`/`error: Option<String>` pair of fields that would
+/// let "searching" and "has an error" and "has results" all be
+/// (nonsensically) true or absent at once — so a caller matching on it can
+/// never observe an incoherent combination.
+#[derive(Debug, Clone)]
+pub enum FindPhase {
+    /// The worker is running; no results exist yet. PREVIEW shows nothing
+    /// during this phase (see `AppState::current_preview_source`).
+    Searching,
+    /// The worker finished without error.
+    Ready(FindReady),
+    /// The worker's call to `core::find::find_recursive` itself returned
+    /// `Err` (an invalid/inaccessible root — `core::find`'s own hard-error
+    /// case, not a partially-skipped subtree, which it already folds into
+    /// a successful `FindOutcome`). Holds `io::Error::to_string()`, not the
+    /// `io::Error` itself — `Action`/`AppState` stay free of `io::Error` as
+    /// a stored type, only ever converting it once, right here.
+    Error(String),
+}
+
+/// One FIND search: the immutable request it was submitted with, plus its
+/// current, mutable `phase`. `AppState.find` is `None` whenever FIND isn't
+/// active at all — a `FindSession` only ever exists while there is one to
+/// show.
+#[derive(Debug, Clone)]
+pub struct FindSession {
+    /// Monotonic per-`AppState` counter (`AppState::next_find_generation`).
+    /// The only thing a completion is ever checked against — never the
+    /// query string — so two searches for the same text in a row still
+    /// can't have a stale one silently mistaken for the current one (see
+    /// `AppState::complete_find`).
+    generation: u64,
+    /// The committed query FIND is (or was) searching for — what a `/`- or
+    /// `f`-reopen pre-fills, and what `mode-text` shows alongside "FIND:".
+    query: String,
+    /// Snapshotted `current_dir` at the moment the search started — never
+    /// re-read afterward, so a real navigation that happens to land back on
+    /// the same directory later doesn't retroactively change what an
+    /// in-flight or completed search was run against.
+    root: PathBuf,
+    /// Snapshotted `Navigation::show_hidden()` at the same moment, for the
+    /// same reason.
+    include_hidden: bool,
+    phase: FindPhase,
+}
+
+impl FindSession {
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn phase(&self) -> &FindPhase {
+        &self.phase
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn include_hidden(&self) -> bool {
+        self.include_hidden
+    }
+}
+
 /// Toolkit-agnostic application state. This is the source of truth; any UI
 /// model (a Slint `ModelRc`, or anything else) is only a projection of it.
 ///
@@ -68,6 +170,17 @@ pub struct AppState {
     entries: Vec<FileEntry>,
     selected: Option<usize>,
     filter_query: String,
+    /// FIND (M5T-B2): `None` whenever FIND is inactive. Deliberately its
+    /// own, separate optional session rather than living inside
+    /// `entries`/`selected` — see the struct-level doc comment's FILTER
+    /// invariants, which FIND must not disturb any more than FILTER did:
+    /// `entries` stays the current directory's full listing, `selected`
+    /// stays its real index, regardless of whether FIND is showing
+    /// something else in CURRENT entirely.
+    find: Option<FindSession>,
+    /// Monotonic counter handed out as each `FindSession`'s `generation` —
+    /// never reset, never reused, incremented once per `start_find` call.
+    next_find_generation: u64,
     parent: ParentContext,
     preview: PreviewContext,
     places: Vec<Place>,
@@ -100,6 +213,8 @@ impl AppState {
             entries,
             selected,
             filter_query: String::new(),
+            find: None,
+            next_find_generation: 0,
             parent,
             preview,
             places,
@@ -131,6 +246,15 @@ impl AppState {
     /// `ClearFilter` arm and [`Self::visible_indices`]).
     pub fn filter_query(&self) -> &str {
         &self.filter_query
+    }
+
+    /// FIND's active session, if any — `None` means FIND isn't showing
+    /// anything and CURRENT/PREVIEW should reflect the normal/FILTER view
+    /// exactly as before this milestone. `ui/window.rs` is the only reader:
+    /// when `Some`, it renders `FindPhase`-appropriate rows/status instead
+    /// of [`Self::visible_entries`], and otherwise falls back to it.
+    pub fn find_session(&self) -> Option<&FindSession> {
+        self.find.as_ref()
     }
 
     /// The subset of `entries()` that FILTER's current query lets through,
@@ -203,11 +327,16 @@ impl AppState {
             Action::SelectLast => self.select_last(),
             Action::ActivateSelected => self.activate_selected(),
             Action::ActivateIndex(index) => {
-                // `index` is a position in the currently *visible*
-                // (filtered) list — exactly what a click reports it
-                // against, since that's the list CURRENT renders. Equal to
-                // a full-list index whenever no filter is active.
-                if index >= self.visible_indices().len() {
+                // `index` is a position in whatever list CURRENT is
+                // currently rendering — FIND's results when FIND is Ready,
+                // otherwise the FILTER-visible (or full, if unfiltered)
+                // list — exactly what a click reports it against.
+                let in_bounds = if let Some(session) = self.find.as_ref() {
+                    matches!(&session.phase, FindPhase::Ready(ready) if index < ready.results.len())
+                } else {
+                    index < self.visible_indices().len()
+                };
+                if !in_bounds {
                     // A no-op `select_index` still leaves `self.selected`
                     // pointing at whatever was selected before — and
                     // `activate_selected` acts on `self.selected`, not on
@@ -226,17 +355,33 @@ impl AppState {
             Action::ToggleHidden => self.toggle_hidden(),
             Action::SetFilterQuery(query) => self.set_filter_query(query),
             Action::ClearFilter => self.clear_filter(),
+            Action::StartFind(query) => self.start_find(query),
+            Action::ClearFind => self.clear_find(),
+            Action::CancelCurrentView => self.cancel_current_view(),
         }
     }
 
-    /// Clamped move by `delta`, entirely within the currently *visible*
-    /// (filtered) ordering — `j`/`k`/arrows never land on a filtered-out
-    /// entry. Identical to a plain full-list move when no filter is
-    /// active. A no-op when it doesn't actually change the selection (e.g.
-    /// already on the last visible entry and moving further down) reports
-    /// `Update::NONE` rather than `PREVIEW_ONLY`: nothing changed, so
-    /// nothing should be re-read.
+    /// Clamped move by `delta` within whatever CURRENT is rendering right
+    /// now: FIND's own results when FIND is `Ready` (never touching the
+    /// normal directory's `selected` — see `FindReady::selected`'s doc
+    /// comment), otherwise the FILTER-visible (or full) ordering exactly as
+    /// before this milestone. A no-op when it doesn't actually change the
+    /// selection reports `Update::NONE` rather than `PREVIEW_ONLY`: nothing
+    /// changed, so nothing should be re-read.
     fn select_by(&mut self, delta: i32) -> Update {
+        if let Some(session) = self.find.as_mut() {
+            let changed = match &mut session.phase {
+                FindPhase::Ready(ready) => Self::move_find_selection(ready, delta),
+                // Searching/Error: nothing to navigate yet.
+                _ => false,
+            };
+            if !changed {
+                return Update::NONE;
+            }
+            self.refresh_preview();
+            return Update::PREVIEW_ONLY;
+        }
+
         let visible = self.visible_indices();
         if visible.is_empty() {
             return Update::NONE;
@@ -257,19 +402,54 @@ impl AppState {
         Update::PREVIEW_ONLY
     }
 
-    /// Selects the entry at `visible_index`, a position in the currently
-    /// *visible* (filtered) list — exactly what a click reports it
-    /// against, and what `select_first`/`select_last` pass in. Equal to a
-    /// full-list index whenever no filter is active. A no-op both for an
-    /// out-of-range index and for re-selecting the entry that's already
-    /// selected — the latter matters because the UI layer's own
-    /// selection-sync (`sync_selection`) round-trips through Slint's
-    /// `current-item-changed` back into this same call with the index it
-    /// was just told to set; without this check that round-trip would
-    /// rebuild PREVIEW a second time for nothing.
-    fn select_index(&mut self, visible_index: usize) -> Update {
+    /// Moves `ready.selected` by `delta`, clamped within `ready.results`.
+    /// Returns whether it actually changed. A free function (not a method)
+    /// since it only ever touches the `FindReady` it's handed — no access
+    /// to `self` needed, and none given, so it can't accidentally reach
+    /// past FIND's own selection into the normal one.
+    fn move_find_selection(ready: &mut FindReady, delta: i32) -> bool {
+        if ready.results.is_empty() {
+            return false;
+        }
+        let last = ready.results.len() as i32 - 1;
+        let current = ready.selected.map(|i| i as i32).unwrap_or(-1);
+        let next = (current + delta).clamp(0, last) as usize;
+        if ready.selected == Some(next) {
+            return false;
+        }
+        ready.selected = Some(next);
+        true
+    }
+
+    /// Selects the entry at `index` in whatever CURRENT is rendering right
+    /// now — FIND's results when FIND is `Ready` (see [`Self::select_by`]),
+    /// otherwise a position in the FILTER-visible (or full) list, exactly
+    /// what a click reports it against and what `select_first`/
+    /// `select_last` pass in. Equal to a full-list index whenever no filter
+    /// or FIND is active. A no-op both for an out-of-range index and for
+    /// re-selecting the entry that's already selected — the latter matters
+    /// because the UI layer's own selection-sync (`sync_selection`)
+    /// round-trips through Slint's `current-item-changed` back into this
+    /// same call with the index it was just told to set; without this
+    /// check that round-trip would rebuild PREVIEW a second time for
+    /// nothing.
+    fn select_index(&mut self, index: usize) -> Update {
+        if let Some(session) = self.find.as_mut() {
+            return match &mut session.phase {
+                FindPhase::Ready(ready) => {
+                    if index >= ready.results.len() || ready.selected == Some(index) {
+                        return Update::NONE;
+                    }
+                    ready.selected = Some(index);
+                    self.refresh_preview();
+                    Update::PREVIEW_ONLY
+                }
+                _ => Update::NONE,
+            };
+        }
+
         let visible = self.visible_indices();
-        let Some(&full_index) = visible.get(visible_index) else {
+        let Some(&full_index) = visible.get(index) else {
             return Update::NONE;
         };
         if self.selected == Some(full_index) {
@@ -280,11 +460,17 @@ impl AppState {
         Update::PREVIEW_ONLY
     }
 
-    /// Selects the first *visible* entry (`gg`). A no-op — `Update::NONE`,
-    /// no preview rebuild — both when nothing is currently visible and when
-    /// the first visible entry is already selected, via the same
+    /// Selects the first entry of whatever's current (`gg`). A no-op —
+    /// `Update::NONE`, no preview rebuild — both when nothing is currently
+    /// shown and when the first entry is already selected, via the same
     /// re-selection guard as [`Self::select_index`].
     fn select_first(&mut self) -> Update {
+        if let Some(session) = self.find.as_ref() {
+            return match &session.phase {
+                FindPhase::Ready(ready) if !ready.results.is_empty() => self.select_index(0),
+                _ => Update::NONE,
+            };
+        }
         if self.visible_indices().is_empty() {
             Update::NONE
         } else {
@@ -292,10 +478,17 @@ impl AppState {
         }
     }
 
-    /// Selects the last *visible* entry (`G`). Same no-op guarantees as
-    /// [`Self::select_first`], mirrored for the other end of the visible
-    /// list.
+    /// Selects the last entry of whatever's current (`G`). Same guarantees
+    /// as [`Self::select_first`], mirrored for the other end.
     fn select_last(&mut self) -> Update {
+        if let Some(session) = self.find.as_ref() {
+            return match &session.phase {
+                FindPhase::Ready(ready) if !ready.results.is_empty() => {
+                    self.select_index(ready.results.len() - 1)
+                }
+                _ => Update::NONE,
+            };
+        }
         let visible_len = self.visible_indices().len();
         if visible_len == 0 {
             Update::NONE
@@ -331,7 +524,36 @@ impl AppState {
     /// Activates the selected entry. Only directories (or symlinks that
     /// resolve to one) cause navigation; activating a regular file is a
     /// deliberate no-op in this milestone (openers arrive later).
+    /// Activates whatever's currently selected. When FIND is `Ready`, a
+    /// selected `Directory` result navigates there (and, via
+    /// [`Self::reload`], clears both FIND and FILTER — a real directory
+    /// change always does); any other kind (`File`/`Symlink`/`Other`) is a
+    /// deliberate no-op — openers belong to a future milestone. A failed
+    /// navigation leaves FIND (and `current_dir`) completely untouched, the
+    /// same "no side effect on failure" rule every other navigation here
+    /// already follows.
     fn activate_selected(&mut self) -> Update {
+        if let Some(session) = self.find.as_ref() {
+            return match &session.phase {
+                FindPhase::Ready(ready) => {
+                    let Some(entry) = ready.selected.and_then(|i| ready.results.get(i)) else {
+                        return Update::NONE;
+                    };
+                    if entry.kind() != EntryKind::Directory {
+                        return Update::NONE;
+                    }
+                    let target = entry.path().to_path_buf();
+                    if self.navigation.navigate_to(&target).is_ok() {
+                        self.reload();
+                        Update::ALL
+                    } else {
+                        Update::NONE
+                    }
+                }
+                _ => Update::NONE,
+            };
+        }
+
         let Some(target) = self
             .selected_entry()
             .map(|entry| entry.path().to_path_buf())
@@ -359,13 +581,18 @@ impl AppState {
     /// `activate_selected`/`go_parent`/`go_system_place` all call this only
     /// after `Navigation` confirms the target really is a new
     /// `current_dir`, never on a failed or same-directory navigation
-    /// (those return `Update::NONE` before ever reaching here). FILTER is
-    /// scoped to one directory's listing, so it's cleared unconditionally
-    /// here: a new directory never inherits the previous one's query.
+    /// (those return `Update::NONE` before ever reaching here). FILTER and
+    /// FIND (M5T-B2) are both scoped to one directory's listing, so both
+    /// are cleared unconditionally here: a new directory never inherits the
+    /// previous one's query or search — `self.find = None` also means any
+    /// worker still running for the old directory reports back to a
+    /// generation that no longer exists, so `complete_find` discards it
+    /// (see its own doc comment).
     fn reload(&mut self) {
         self.entries = self.navigation.entries().unwrap_or_default();
         self.selected = initial_selection(&self.entries);
         self.filter_query.clear();
+        self.find = None;
         self.refresh_contexts();
     }
 
@@ -378,6 +605,14 @@ impl AppState {
     /// listed (e.g. a dotfile that just got hidden again), or to no
     /// selection if the directory is now empty.
     fn toggle_hidden(&mut self) -> Update {
+        // `.` never reruns FIND automatically (that would couple a plain
+        // Action to the worker/generation scheduler) — clearing it here
+        // both drops any results computed under the old `show_hidden` and
+        // invalidates a still-running search's completion (see
+        // `complete_find`'s generation check). The user can press `f`
+        // again afterward.
+        self.find = None;
+
         let selected_path = self
             .selected_entry()
             .map(|entry| entry.path().to_path_buf());
@@ -504,6 +739,132 @@ impl AppState {
         }
     }
 
+    /// Starts a new FIND search for `query` (never called with an empty
+    /// one — `ui/window.rs` branches to [`Self::clear_find`] instead; see
+    /// `Action::StartFind`'s own doc comment). Snapshots `root`/
+    /// `include_hidden` from `current_dir`/`show_hidden` right now, hands
+    /// out a fresh generation, and sets the phase to `Searching` — this
+    /// method never touches the filesystem itself and never blocks;
+    /// actually running `core::find::find_recursive` off the UI thread and
+    /// eventually calling [`Self::complete_find`] back is `ui/window.rs`'s
+    /// job (see that module's own doc comments for why the boundary sits
+    /// exactly there).
+    fn start_find(&mut self, query: String) -> Update {
+        let previous_preview_source = self.preview_source_identity();
+        self.next_find_generation += 1;
+        self.find = Some(FindSession {
+            generation: self.next_find_generation,
+            query,
+            root: self.navigation.current_dir().to_path_buf(),
+            include_hidden: self.navigation.show_hidden(),
+            phase: FindPhase::Searching,
+        });
+        // `Searching` always has a `None` preview source (see
+        // `current_preview_source`) — but whether that's actually a
+        // *change* depends on what was showing a moment ago: nothing, if
+        // CURRENT already had no selection, or a real entry, if it did.
+        // See `finish_preview_transition`'s own doc comment for why this
+        // is a path-identity comparison, never a presentation/`Debug` one.
+        let preview_changed = self.finish_preview_transition(previous_preview_source);
+        Update {
+            current_changed: true,
+            parent_changed: false,
+            preview_changed,
+        }
+    }
+
+    /// Clears FIND back to inactive. A no-op when it already is. Otherwise
+    /// this is also what invalidates any search still in flight: once
+    /// `self.find` is `None`, [`Self::complete_find`] has no session left
+    /// to match a generation against, so a completion that arrives later
+    /// is silently discarded (`Update::NONE`) — never applied, never
+    /// causing a panic. PREVIEW goes back to the normal/FILTER selection
+    /// (`current_preview_source` falls through to `selected_entry` the
+    /// instant `self.find` is `None`) — but only actually rebuilds, and
+    /// only reports `preview_changed`, when that's a different entry than
+    /// FIND was just showing (see `finish_preview_transition`).
+    fn clear_find(&mut self) -> Update {
+        if self.find.is_none() {
+            return Update::NONE;
+        }
+        let previous_preview_source = self.preview_source_identity();
+        self.find = None;
+        let preview_changed = self.finish_preview_transition(previous_preview_source);
+        Update {
+            current_changed: true,
+            parent_changed: false,
+            preview_changed,
+        }
+    }
+
+    /// `Esc` with no editor focused (`Action::CancelCurrentView`): cancels
+    /// whichever transient view is currently on top. FIND, if active, takes
+    /// priority over FILTER — this is the one and only priority rule, not
+    /// a general "modes" stack, since only these two transient views exist.
+    fn cancel_current_view(&mut self) -> Update {
+        if self.find.is_some() {
+            self.clear_find()
+        } else {
+            self.clear_filter()
+        }
+    }
+
+    /// Applies a FIND worker's result — called from `ui/window.rs` once a
+    /// completion has crossed back onto the UI thread (never from the
+    /// worker thread itself; see that module's doc comments). Not an
+    /// `Action`: nothing about this is a user input, and stuffing an
+    /// `io::Result` through the same enum every keystroke/click also flows
+    /// through would mean `Action` (and everything that matches on it)
+    /// carrying a variant no real input ever produces.
+    ///
+    /// `generation` is checked against the *current* session's — by id,
+    /// never by comparing query strings, so two back-to-back searches for
+    /// the same text still can't have a stale completion mistaken for the
+    /// live one. Three ways a completion is stale, all reported the same
+    /// (`Update::NONE`, `self.find` left exactly as it is): FIND was
+    /// cleared while this search was running (`self.find` is now `None`
+    /// entirely), a newer search superseded it (`self.find`'s generation
+    /// moved on), or `.` was pressed meanwhile (also clears `self.find`,
+    /// covered by the first case).
+    pub fn complete_find(&mut self, generation: u64, result: io::Result<FindOutcome>) -> Update {
+        match self.find.as_ref() {
+            Some(session) if session.generation == generation => {}
+            _ => return Update::NONE,
+        }
+        // Read before mutating `self.find.phase` below — `Searching`'s
+        // preview source is always `None` (see `current_preview_source`),
+        // so this is really just documenting "nothing was showing yet",
+        // but going through the same snapshot-then-compare helper as
+        // `start_find`/`clear_find` keeps all three transitions provably
+        // consistent rather than special-casing this one.
+        let previous_preview_source = self.preview_source_identity();
+        let session = self.find.as_mut().expect("checked above");
+        session.phase = match result {
+            Ok(outcome) => FindPhase::Ready(FindReady {
+                selected: if outcome.results.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                },
+                results: outcome.results,
+                truncated: outcome.truncated,
+                skipped_count: outcome.skipped_errors.len(),
+            }),
+            Err(err) => FindPhase::Error(err.to_string()),
+        };
+        // A real change only when landing on `Ready` with a first result
+        // (`None` -> `Some(path)`) — zero results or an `Error` both leave
+        // the preview source at `None`, same as `Searching`, so
+        // `finish_preview_transition` correctly reports no change and
+        // skips rebuilding `PreviewContext` for nothing.
+        let preview_changed = self.finish_preview_transition(previous_preview_source);
+        Update {
+            current_changed: true,
+            parent_changed: false,
+            preview_changed,
+        }
+    }
+
     /// Rebuilds both PARENT and PREVIEW. Used whenever `current_dir` or
     /// `show_hidden` changed — anything that could move PARENT's target
     /// necessarily also invalidates PREVIEW, since PREVIEW's target
@@ -517,7 +878,61 @@ impl AppState {
     /// Rebuilds only PREVIEW. Used on a plain selection move, so a `j`/`k`
     /// press never re-reads PARENT's listing for no reason.
     fn refresh_preview(&mut self) {
-        self.preview = PreviewContext::build(self.selected_entry(), self.navigation.show_hidden());
+        self.preview =
+            PreviewContext::build(self.current_preview_source(), self.navigation.show_hidden());
+    }
+
+    /// The entry PREVIEW should currently reflect: FIND's selected result
+    /// while FIND is `Ready`, nothing at all while it's `Searching`/
+    /// `Error` (there is no meaningful "selected result" yet), and the
+    /// normal/FILTER selection otherwise — exactly `Self::selected_entry`,
+    /// unaffected by FIND either way. This is the one seam that lets
+    /// [`Self::refresh_preview`] stay a single call site: every action that
+    /// changes what should be previewed (a FIND selection move, a
+    /// completion arriving, FIND being cleared, a plain `j`/`k`, ...) just
+    /// calls it, and this decides what "the selection" means right now.
+    fn current_preview_source(&self) -> Option<&FileEntry> {
+        match self.find.as_ref().map(|session| &session.phase) {
+            Some(FindPhase::Ready(ready)) => ready.selected.and_then(|i| ready.results.get(i)),
+            Some(FindPhase::Searching) | Some(FindPhase::Error(_)) => None,
+            None => self.selected_entry(),
+        }
+    }
+
+    /// [`Self::current_preview_source`]'s *identity* — `entry.path()`,
+    /// never a presentation string, `Debug` output, or basename — as an
+    /// owned, borrow-free snapshot a caller can take before mutating
+    /// `self.find` and still compare afterward. `None` and `None` compare
+    /// equal regardless of *why* there's no source (no selection at all
+    /// vs. `Searching`/`Error`), which is exactly the M5T-B2 V2 audit's
+    /// point: sameness of identity is all that should ever decide
+    /// `preview_changed`, never which phase produced it.
+    fn preview_source_identity(&self) -> Option<PathBuf> {
+        self.current_preview_source()
+            .map(|entry| entry.path().to_path_buf())
+    }
+
+    /// Rebuilds PREVIEW only if its source's identity actually moved away
+    /// from `previous` (a snapshot the caller took via
+    /// [`Self::preview_source_identity`] *before* changing `self.find`),
+    /// and returns whether it did — exactly the `preview_changed` value
+    /// [`Self::start_find`]/[`Self::complete_find`]/[`Self::clear_find`]
+    /// each report. Shared by all three because none of them can tell
+    /// up front whether the source moved (unlike FILTER's own edits,
+    /// which already know via `resettle_selection_to_filter`'s return
+    /// value) — comparing by `PathBuf` identity before/after is the
+    /// smallest correct way to find out, and reusing one helper for it
+    /// means the three transitions can't quietly drift into comparing it
+    /// three different ways. Valid here specifically because none of
+    /// these three transitions ever change `show_hidden` — the other
+    /// input `PreviewContext::build` takes — so identity alone is
+    /// sufficient, not just convenient.
+    fn finish_preview_transition(&mut self, previous: Option<PathBuf>) -> bool {
+        let changed = previous != self.preview_source_identity();
+        if changed {
+            self.refresh_preview();
+        }
+        changed
     }
 }
 
@@ -1657,4 +2072,608 @@ mod tests {
 
         assert_eq!(state.filter_query(), "cargo");
     }
+
+    // --- FIND (M5T-B2) -----------------------------------------------------
+    //
+    // These never call `core::find::find_recursive` (that's M5T-B1's own
+    // job, already tested there) — a `FindOutcome` is built directly and
+    // handed to `complete_find`, exactly as `ui/window.rs`'s completion
+    // handler would after a worker actually ran. Real `FileEntry` values
+    // still come from real files on disk (`FileEntry::from_path`/
+    // `from_dir_entry` are the only constructors — nothing here rebuilds
+    // one from a bare string), so identity stays exactly what production
+    // code would see.
+
+    fn find_fixture_dir() -> TempDir {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("readme.md"), b"").unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src").join("main.rs"), b"fn main() {}").unwrap();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs").join("main-notes.md"), b"notes").unwrap();
+        dir
+    }
+
+    fn find_state() -> (TempDir, AppState) {
+        let dir = find_fixture_dir();
+        let state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        (dir, state)
+    }
+
+    fn find_entry(path: std::path::PathBuf) -> FileEntry {
+        FileEntry::from_path(path).expect("fixture path must exist")
+    }
+
+    fn find_outcome(results: Vec<FileEntry>) -> FindOutcome {
+        FindOutcome {
+            results,
+            truncated: false,
+            skipped_errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn starting_find_preserves_normal_entries() {
+        let (_dir, mut state) = find_state();
+        let before = names(&state);
+
+        state.dispatch(Action::StartFind("main".to_string()));
+
+        assert_eq!(names(&state), before);
+    }
+
+    #[test]
+    fn starting_find_preserves_normal_selected() {
+        let (_dir, mut state) = find_state();
+        let before = state.selected();
+
+        state.dispatch(Action::StartFind("main".to_string()));
+
+        assert_eq!(state.selected(), before);
+    }
+
+    #[test]
+    fn starting_find_preserves_active_filter() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::SetFilterQuery("main".to_string()));
+
+        state.dispatch(Action::StartFind("readme".to_string()));
+
+        assert_eq!(state.filter_query(), "main");
+    }
+
+    #[test]
+    fn find_request_snapshots_current_dir() {
+        let (dir, mut state) = find_state();
+
+        state.dispatch(Action::StartFind("main".to_string()));
+
+        assert_eq!(state.find_session().unwrap().root(), dir.path());
+    }
+
+    #[test]
+    fn find_request_snapshots_show_hidden() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::ToggleHidden); // show_hidden: true (no FIND active yet)
+        assert!(state.show_hidden());
+
+        state.dispatch(Action::StartFind("main".to_string()));
+
+        assert!(state.find_session().unwrap().include_hidden());
+    }
+
+    #[test]
+    fn new_find_gets_new_generation() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("a".to_string()));
+        let first = state.find_session().unwrap().generation();
+        state.dispatch(Action::ClearFind);
+
+        state.dispatch(Action::StartFind("b".to_string()));
+
+        assert_ne!(state.find_session().unwrap().generation(), first);
+    }
+
+    #[test]
+    fn new_find_supersedes_previous_generation() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("a".to_string()));
+        let first = state.find_session().unwrap().generation();
+
+        // Reopening and resubmitting without an explicit `ClearFind` in
+        // between — `f` again, then Enter on a different query.
+        state.dispatch(Action::StartFind("b".to_string()));
+
+        assert_ne!(state.find_session().unwrap().generation(), first);
+        assert_eq!(state.find_session().unwrap().query(), "b");
+    }
+
+    #[test]
+    fn stale_completion_is_ignored() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("a".to_string()));
+        let stale_generation = state.find_session().unwrap().generation();
+        state.dispatch(Action::StartFind("b".to_string()));
+
+        let update = state.complete_find(stale_generation, Ok(FindOutcome::default()));
+
+        assert_eq!(update, Update::NONE);
+        // The live session ("b") is completely unaffected by the stale
+        // completion for the superseded one ("a").
+        assert_eq!(state.find_session().unwrap().query(), "b");
+        assert!(matches!(
+            state.find_session().unwrap().phase(),
+            FindPhase::Searching
+        ));
+    }
+
+    #[test]
+    fn clear_find_invalidates_pending_completion() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("a".to_string()));
+        let generation = state.find_session().unwrap().generation();
+
+        state.dispatch(Action::ClearFind);
+        let update = state.complete_find(generation, Ok(FindOutcome::default()));
+
+        assert_eq!(update, Update::NONE);
+        assert!(state.find_session().is_none());
+    }
+
+    #[test]
+    fn successful_completion_exposes_results() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![find_entry(dir.path().join("src").join("main.rs"))]);
+
+        state.complete_find(generation, Ok(outcome));
+
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.results.len(), 1),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_completion_selects_first_result() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![find_entry(dir.path().join("src").join("main.rs"))]);
+
+        state.complete_find(generation, Ok(outcome));
+
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.selected, Some(0)),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_results_have_no_find_selection() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("zzz-no-match".to_string()));
+        let generation = state.find_session().unwrap().generation();
+
+        state.complete_find(generation, Ok(FindOutcome::default()));
+
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.selected, None),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_selection_does_not_mutate_normal_selected() {
+        let (dir, mut state) = find_state();
+        let normal_selected = state.selected();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![
+            find_entry(dir.path().join("docs").join("main-notes.md")),
+            find_entry(dir.path().join("src").join("main.rs")),
+        ]);
+        state.complete_find(generation, Ok(outcome));
+
+        state.dispatch(Action::SelectNext);
+
+        assert_eq!(state.selected(), normal_selected);
+    }
+
+    #[test]
+    fn clearing_find_restores_normal_selection() {
+        let (dir, mut state) = find_state();
+        let normal_selected_path = state.selected_entry().unwrap().path().to_path_buf();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![find_entry(dir.path().join("src").join("main.rs"))]);
+        state.complete_find(generation, Ok(outcome));
+
+        state.dispatch(Action::ClearFind);
+
+        assert_eq!(
+            state.selected_entry().unwrap().path(),
+            normal_selected_path.as_path()
+        );
+    }
+
+    #[test]
+    fn clearing_find_restores_normal_preview() {
+        let (dir, mut state) = find_state();
+        let normal_preview = format!("{:?}", state.preview());
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![find_entry(dir.path().join("src").join("main.rs"))]);
+        state.complete_find(generation, Ok(outcome));
+        assert_ne!(format!("{:?}", state.preview()), normal_preview);
+
+        state.dispatch(Action::ClearFind);
+
+        assert_eq!(format!("{:?}", state.preview()), normal_preview);
+    }
+
+    #[test]
+    fn clearing_find_restores_underlying_filter_view() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::SetFilterQuery("main".to_string()));
+        let filtered_before = visible_names(&state);
+        state.dispatch(Action::StartFind("readme".to_string()));
+
+        state.dispatch(Action::ClearFind);
+
+        assert_eq!(state.filter_query(), "main");
+        assert_eq!(visible_names(&state), filtered_before);
+    }
+
+    #[test]
+    fn find_selection_next_previous_uses_find_results() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![
+            find_entry(dir.path().join("docs").join("main-notes.md")),
+            find_entry(dir.path().join("src").join("main.rs")),
+        ]);
+        state.complete_find(generation, Ok(outcome));
+
+        state.dispatch(Action::SelectNext);
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.selected, Some(1)),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+
+        state.dispatch(Action::SelectPrevious);
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.selected, Some(0)),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gg_and_g_use_find_results() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![
+            find_entry(dir.path().join("docs").join("main-notes.md")),
+            find_entry(dir.path().join("src").join("main.rs")),
+        ]);
+        state.complete_find(generation, Ok(outcome));
+        state.dispatch(Action::SelectNext); // now at index 1
+
+        state.dispatch(Action::SelectFirst); // gg
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.selected, Some(0)),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+
+        state.dispatch(Action::SelectLast); // G
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.selected, Some(1)),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_preview_follows_selected_result() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![
+            find_entry(dir.path().join("docs").join("main-notes.md")),
+            find_entry(dir.path().join("src").join("main.rs")),
+        ]);
+        state.complete_find(generation, Ok(outcome));
+        let preview_first = format!("{:?}", state.preview());
+
+        let update = state.dispatch(Action::SelectNext);
+
+        assert!(update.preview_changed);
+        assert_ne!(format!("{:?}", state.preview()), preview_first);
+    }
+
+    #[test]
+    fn directory_result_activation_navigates_and_clears_find() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("src".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![find_entry(dir.path().join("src"))]);
+        state.complete_find(generation, Ok(outcome));
+
+        let update = state.dispatch(Action::ActivateSelected);
+
+        assert_eq!(update, Update::ALL);
+        assert_eq!(state.current_dir(), dir.path().join("src"));
+        assert!(state.find_session().is_none());
+    }
+
+    #[test]
+    fn non_directory_result_activation_is_noop() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![find_entry(dir.path().join("src").join("main.rs"))]);
+        state.complete_find(generation, Ok(outcome));
+
+        let update = state.dispatch(Action::ActivateSelected);
+
+        assert_eq!(update, Update::NONE);
+        assert_eq!(state.current_dir(), dir.path());
+        assert!(state.find_session().is_some());
+    }
+
+    #[test]
+    fn failed_directory_navigation_keeps_find() {
+        let (dir, mut state) = find_state();
+        let ghost = dir.path().join("ghost_dir");
+        fs::create_dir(&ghost).unwrap();
+        let ghost_entry = find_entry(ghost.clone());
+        fs::remove_dir(&ghost).unwrap(); // exists no more by activation time
+
+        state.dispatch(Action::StartFind("ghost".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        state.complete_find(generation, Ok(find_outcome(vec![ghost_entry])));
+
+        let update = state.dispatch(Action::ActivateSelected);
+
+        assert_eq!(update, Update::NONE);
+        assert!(state.find_session().is_some());
+    }
+
+    #[test]
+    fn successful_go_parent_clears_find() {
+        let dir = TempDir::new();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("main.rs"), b"").unwrap();
+        let mut state = test_state(Navigation::new(sub).unwrap());
+        state.dispatch(Action::StartFind("main".to_string()));
+        assert!(state.find_session().is_some());
+
+        let update = state.dispatch(Action::GoParent);
+
+        assert_eq!(update, Update::ALL);
+        assert!(state.find_session().is_none());
+        assert_eq!(state.current_dir(), dir.path());
+    }
+
+    #[test]
+    fn failed_go_parent_keeps_find() {
+        let mut state = test_state(Navigation::new(std::path::PathBuf::from("/")).unwrap());
+        state.dispatch(Action::StartFind("x".to_string()));
+        assert!(state.find_session().is_some());
+
+        let update = state.dispatch(Action::GoParent);
+
+        assert_eq!(update, Update::NONE);
+        assert!(state.find_session().is_some());
+    }
+
+    #[test]
+    fn system_place_navigation_clears_find_on_success() {
+        let root = TempDir::new();
+        let start = place_dir(&root, "start");
+        let home = place_dir(&root, "home");
+        let places = vec![Place::new_for_test(SystemPlaceKind::Home, home.clone())];
+        let mut state = state_with_places(start, places);
+        state.dispatch(Action::StartFind("x".to_string()));
+
+        let update = state.dispatch(Action::GoSystemPlace(SystemPlaceKind::Home));
+
+        assert_eq!(update, Update::ALL);
+        assert!(state.find_session().is_none());
+        assert_eq!(state.current_dir(), home);
+    }
+
+    #[test]
+    fn toggle_hidden_clears_find_without_auto_rerun() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        assert!(state.find_session().is_some());
+
+        state.dispatch(Action::ToggleHidden);
+
+        assert!(state.find_session().is_none());
+        assert!(state.show_hidden());
+    }
+
+    #[test]
+    fn completion_error_produces_find_error_state() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+
+        state.complete_find(
+            generation,
+            Err(io::Error::new(io::ErrorKind::NotFound, "gone")),
+        );
+
+        match state.find_session().unwrap().phase() {
+            FindPhase::Error(message) => assert!(!message.is_empty()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_error_completion_is_ignored() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("a".to_string()));
+        let stale_generation = state.find_session().unwrap().generation();
+        state.dispatch(Action::StartFind("b".to_string()));
+
+        let update = state.complete_find(
+            stale_generation,
+            Err(io::Error::new(io::ErrorKind::NotFound, "gone")),
+        );
+
+        assert_eq!(update, Update::NONE);
+        assert!(matches!(
+            state.find_session().unwrap().phase(),
+            FindPhase::Searching
+        ));
+    }
+
+    #[test]
+    fn truncated_outcome_is_preserved_for_status() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = FindOutcome {
+            results: vec![find_entry(dir.path().join("src").join("main.rs"))],
+            truncated: true,
+            skipped_errors: Vec::new(),
+        };
+
+        state.complete_find(generation, Ok(outcome));
+
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert!(ready.truncated),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skipped_error_count_is_preserved_for_status() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = FindOutcome {
+            results: vec![find_entry(dir.path().join("src").join("main.rs"))],
+            truncated: false,
+            skipped_errors: vec![std::path::PathBuf::from("/some/blocked/dir")],
+        };
+
+        state.complete_find(generation, Ok(outcome));
+
+        match state.find_session().unwrap().phase() {
+            FindPhase::Ready(ready) => assert_eq!(ready.skipped_count, 1),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    // --- FIND preview_changed precision (M5T-B2 V2 audit) -------------------
+    //
+    // V1's `start_find`/`complete_find`/`clear_find` reported
+    // `preview_changed: true` unconditionally, even across a `None` ->
+    // `None` transition — rebuilding `PreviewContext` (and telling
+    // `ui/window.rs` to re-sync it) for nothing. These pin the corrected,
+    // identity-based rule (`finish_preview_transition`) at exactly the
+    // boundary that used to be wrong: same source before/after -> `false`,
+    // no rebuild.
+
+    #[test]
+    fn start_find_from_no_preview_does_not_report_preview_change() {
+        let dir = TempDir::new(); // empty: no selection, no preview, going in
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert!(state.selected_entry().is_none());
+        assert!(matches!(state.preview(), PreviewContext::None));
+
+        let update = state.dispatch(Action::StartFind("main".to_string()));
+
+        assert!(update.current_changed);
+        assert!(!update.parent_changed);
+        assert!(!update.preview_changed);
+    }
+
+    #[test]
+    fn start_find_from_existing_preview_reports_preview_change() {
+        let (_dir, mut state) = find_state();
+        assert!(state.selected_entry().is_some());
+
+        let update = state.dispatch(Action::StartFind("main".to_string()));
+
+        assert!(update.preview_changed);
+    }
+
+    #[test]
+    fn zero_result_completion_does_not_report_preview_change() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("zzz-no-match".to_string()));
+        let generation = state.find_session().unwrap().generation();
+
+        let update = state.complete_find(generation, Ok(FindOutcome::default()));
+
+        assert!(update.current_changed);
+        assert!(!update.parent_changed);
+        assert!(!update.preview_changed);
+    }
+
+    #[test]
+    fn error_completion_does_not_report_preview_change() {
+        let (_dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+
+        let update = state.complete_find(
+            generation,
+            Err(io::Error::new(io::ErrorKind::NotFound, "gone")),
+        );
+
+        assert!(update.current_changed);
+        assert!(!update.parent_changed);
+        assert!(!update.preview_changed);
+    }
+
+    #[test]
+    fn non_empty_completion_reports_preview_change() {
+        let (dir, mut state) = find_state();
+        state.dispatch(Action::StartFind("main".to_string()));
+        let generation = state.find_session().unwrap().generation();
+        let outcome = find_outcome(vec![find_entry(dir.path().join("src").join("main.rs"))]);
+
+        let update = state.complete_find(generation, Ok(outcome));
+
+        assert!(update.preview_changed);
+    }
+
+    #[test]
+    fn clear_find_to_no_underlying_preview_does_not_report_preview_change() {
+        let dir = TempDir::new(); // empty: normal/FILTER view has no preview either
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::StartFind("main".to_string())); // Searching: preview None
+        assert!(matches!(state.preview(), PreviewContext::None));
+
+        let update = state.dispatch(Action::ClearFind);
+
+        assert!(update.current_changed);
+        assert!(!update.preview_changed);
+    }
+
+    #[test]
+    fn clear_find_restoring_underlying_preview_reports_preview_change() {
+        let (_dir, mut state) = find_state(); // normal selection has a real preview
+        state.dispatch(Action::StartFind("zzz-no-match".to_string())); // Searching: preview None
+
+        let update = state.dispatch(Action::ClearFind);
+
+        assert!(update.preview_changed);
+    }
+
+    // `stale_completion_remains_update_none` (audit item 8): already
+    // covered exactly by `stale_completion_is_ignored` above (asserts
+    // `update == Update::NONE`, which is stronger than just
+    // `preview_changed == false` — nothing about the stale session is
+    // touched at all) — not duplicated here per the audit's own
+    // instruction.
 }

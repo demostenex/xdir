@@ -1,12 +1,27 @@
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, ModelRc, VecModel};
 
-use crate::app::{Action, AppState, FilePreview, PreviewContext};
+use crate::app::{Action, AppState, FIND_MAX_RESULTS, FilePreview, FindPhase, PreviewContext};
 use crate::model::{EntryKind, FileEntry};
 use crate::ui::input::{KeyStroke, Keymap, KeymapResult};
+
+/// What a FIND worker thread hands back — always sent through
+/// `find_tx`/`find_rx` (never captured directly by a `Weak::
+/// upgrade_in_event_loop` closure, which must be `Send` and so could never
+/// hold `Rc<RefCell<AppState>>` anyway; see `begin_find_search`'s own doc
+/// comment for the full reasoning). Both fields are plain `Send` data —
+/// `u64` and `io::Result<core::find::FindOutcome>` (a `Vec<FileEntry>` of
+/// owned `PathBuf`/`OsString`/`EntryKind`, nothing toolkit-specific) — so
+/// this can cross the thread boundary with zero `unsafe`.
+struct FindCompletion {
+    generation: u64,
+    result: std::io::Result<crate::core::find::FindOutcome>,
+}
 
 slint::include_modules!();
 
@@ -75,10 +90,44 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
     let clicks = Rc::new(RefCell::new(ClickTracker::new(DOUBLE_CLICK_WINDOW)));
     let keymap = Rc::new(RefCell::new(Keymap::new()));
 
+    // FIND's worker→UI-thread bridge (M5T-B2). `find_rx` never leaves this
+    // function's scope — it's moved once into the one closure below that
+    // drains it — so there is exactly one reader, on the UI thread, always.
+    // `find_tx` is `Clone`+`Send`; each search spawned by
+    // `begin_find_search` gets its own clone to move into its worker
+    // thread. See `begin_find_search`'s doc comment for why a channel is
+    // the right shape here at all (in short: `Rc<RefCell<AppState>>` isn't
+    // `Send`, so nothing crossing the thread boundary can carry it — only
+    // plain data can, and only a closure already living on the UI thread,
+    // set up right here, can apply that data to `state`).
+    let (find_tx, find_rx) = mpsc::channel::<FindCompletion>();
+
     full_refresh_current(&state, &ui);
     refresh_parent(&state, &ui);
     refresh_preview(&state, &ui);
     ui.invoke_focus_list();
+
+    // A worker calls this indirectly — via `ui_weak.upgrade_in_event_loop`
+    // invoking `invoke_find_completion_ready()` on the real `ui` handle —
+    // purely to wake this closure up; the actual completion payload always
+    // travels through `find_tx`/`find_rx`, never as an argument here (Slint
+    // callback parameters can't carry a `Vec<FileEntry>`/`io::Result`
+    // anyway). Draining in a loop (`try_recv`, not `recv`) means a second
+    // completion that arrived before this ran isn't left stranded until
+    // some unrelated future wakeup.
+    ui.on_find_completion_ready({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            while let Ok(completion) = find_rx.try_recv() {
+                let update = state
+                    .borrow_mut()
+                    .complete_find(completion.generation, completion.result);
+                apply_update(&state, &ui, update);
+            }
+        }
+    });
 
     // `.slint` only names the physical key (a literal character, or one
     // of the "Up"/"Down"/"Left"/"Right"/"Escape"/"Shift" tags it
@@ -140,6 +189,14 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
                     begin_filter_edit(&state, &ui);
                     true
                 }
+                // `f`: same shape as `/` above — no `AppState` change (see
+                // `KeymapResult::EnterFind`'s own doc comment), just show
+                // FIND's input, pre-filled with whatever query is already
+                // committed, and move keyboard focus to it.
+                KeymapResult::EnterFind => {
+                    begin_find_edit(&state, &ui);
+                    true
+                }
                 KeymapResult::Unhandled => false,
             }
         }
@@ -183,6 +240,44 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
             let ui = ui.unwrap();
             apply(&state, &ui, Action::ClearFilter);
             ui.set_filter_editing(false);
+            ui.invoke_focus_list();
+        }
+    });
+
+    // Enter, while FIND is being edited: unlike FILTER, this *does* reach
+    // the filesystem — but only past this point (see `begin_find_search`).
+    // An empty query never starts a worker at all (§5's frozen rule): it
+    // just closes the box and clears whatever FIND session existed.
+    ui.on_find_accepted({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        let find_tx = find_tx.clone();
+        move || {
+            let ui = ui.unwrap();
+            let query = ui.get_find_query().to_string();
+            ui.set_find_editing(false);
+            if query.is_empty() {
+                apply(&state, &ui, Action::ClearFind);
+            } else {
+                begin_find_search(&state, &ui, &find_tx, query);
+            }
+            ui.invoke_focus_list();
+        }
+    });
+
+    // Esc, while FIND is being edited: clears FIND outright (same
+    // no-draft-vs-committed rule FILTER's own Esc-while-editing follows) —
+    // this also invalidates any search still running for the *previous*
+    // committed query, if `f` reopened an active FIND session and the user
+    // then cancelled instead of resubmitting (see
+    // `AppState::complete_find`'s generation check).
+    ui.on_find_escaped({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            apply(&state, &ui, Action::ClearFind);
+            ui.set_find_editing(false);
             ui.invoke_focus_list();
         }
     });
@@ -274,6 +369,16 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
 /// and without that no-op check PREVIEW would be rebuilt for nothing.
 fn apply(state: &Rc<RefCell<AppState>>, ui: &MainWindow, action: Action) {
     let update = state.borrow_mut().dispatch(action);
+    apply_update(state, ui, update);
+}
+
+/// The UI-refresh half of [`apply`], factored out so the FIND-completion
+/// handler (`run`'s `on_find_completion_ready`) can reuse the exact same
+/// current/parent/preview sync `AppState::complete_find` needs — that
+/// method returns an [`crate::app::Update`] like every other state change,
+/// but isn't reached through `dispatch`/`Action` (it's not a user input;
+/// see its own doc comment), so it can't go through [`apply`] itself.
+fn apply_update(state: &Rc<RefCell<AppState>>, ui: &MainWindow, update: crate::app::Update) {
     if update.current_changed {
         full_refresh_current(state, ui);
     } else if update.preview_changed {
@@ -290,42 +395,143 @@ fn apply(state: &Rc<RefCell<AppState>>, ui: &MainWindow, action: Action) {
 /// Shows FILTER's input box and moves keyboard focus to it — pre-filled
 /// with whatever query is already active, so pressing `/` again while a
 /// filter is already committed reopens it for editing rather than starting
-/// over (the milestone's frozen "reopen `/`" rule). No `AppState` call: the
-/// query itself is untouched by opening the box.
+/// over (the milestone's frozen "reopen `/`" rule). Clears FIND first
+/// (M5T-B2, §22): `/` while FIND is active must show the FILTER view
+/// underneath, never reinterpret FIND's results as something to filter —
+/// `Action::ClearFind` is a no-op when FIND wasn't active, so this is safe
+/// unconditionally. `filter_query` itself is never touched by either step.
 fn begin_filter_edit(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+    apply(state, ui, Action::ClearFind);
     let query = state.borrow().filter_query().to_string();
     ui.set_filter_query(query.into());
     ui.set_filter_editing(true);
     ui.invoke_focus_filter_input();
 }
 
+/// Shows FIND's input box and moves keyboard focus to it — pre-filled with
+/// the currently *committed* FIND query if a session is already active
+/// (§5's "reopen" rule, mirroring FILTER's own), empty otherwise. No
+/// `AppState` call of its own: opening the box changes nothing — FIND's
+/// existing results (if any) stay exactly as they are while the user is
+/// only editing the draft, and FILTER underneath is left completely alone
+/// (§23 — unlike `/`, `f` never clears anything).
+fn begin_find_edit(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+    let query = state
+        .borrow()
+        .find_session()
+        .map(|session| session.query().to_string())
+        .unwrap_or_default();
+    ui.set_find_query(query.into());
+    ui.set_find_editing(true);
+    ui.invoke_focus_find_input();
+}
+
+/// Commits `query` (already confirmed non-empty by `on_find_accepted`) and
+/// starts a new recursive search for it, off the UI thread.
+///
+/// # Why a channel, not just a `Weak` handoff
+///
+/// The natural-looking shape — worker computes the result, then calls
+/// `ui_weak.upgrade_in_event_loop(move |ui| { ...apply it to `state`... })`
+/// — doesn't type-check: that closure must be `Send` (it's handed to
+/// `invoke_from_event_loop` beneath `upgrade_in_event_loop`, crossing the
+/// thread boundary at the point it's *constructed*, on the worker thread,
+/// even though it only ever *runs* later, back on the UI thread), and
+/// `Rc<RefCell<AppState>>` is not `Send` — `state` can never be captured by
+/// anything that closure builds. So the worker is only ever given `Send`
+/// data (`root`/`query`/`include_hidden`, a `u64` generation, and a cloned
+/// `mpsc::Sender`), and the *only* thing its `upgrade_in_event_loop`
+/// closure does is invoke a callback that wakes the completion-draining
+/// closure `run` already set up — the one that *does* own `state`, because
+/// it was built on the UI thread back when `run` called `on_find_completion_ready`.
+/// The `Sender`/`Receiver` pair is what actually carries the payload across
+/// the thread boundary; the event-loop handoff is only ever a wakeup
+/// signal.
+///
+/// # Why the window can close mid-search safely
+///
+/// `Weak::upgrade_in_event_loop` (Slint 1.17.1, `i-slint-core::api`) simply
+/// never calls its functor if the component has no more strong references
+/// — so a worker whose window closed before it finished just has its
+/// wakeup silently dropped, and the `let _ =` below discards the
+/// `Result<(), EventLoopError>` for the same reason (an already-terminated
+/// event loop is not a bug to panic over). `find_tx.send(..)` is likewise
+/// `let _ =`: if `find_rx` no longer exists (the whole `run` scope is
+/// gone), the completion has nowhere to go and is simply dropped. Neither
+/// path blocks, joins, or panics.
+fn begin_find_search(
+    state: &Rc<RefCell<AppState>>,
+    ui: &MainWindow,
+    find_tx: &mpsc::Sender<FindCompletion>,
+    query: String,
+) {
+    apply(state, ui, Action::StartFind(query));
+    let (generation, root, query, include_hidden) = {
+        let st = state.borrow();
+        let session = st
+            .find_session()
+            .expect("Action::StartFind always creates a session");
+        (
+            session.generation(),
+            session.root().to_path_buf(),
+            session.query().to_string(),
+            session.include_hidden(),
+        )
+    };
+
+    let tx = find_tx.clone();
+    let ui_weak = ui.as_weak();
+    // The one deliberate exception to "`ui` never calls `core` directly"
+    // (see `src/lib.rs`'s layering doc comment): this closure needs both
+    // `core::find::find_recursive` *and* `slint::Weak`'s event-loop handoff
+    // in the same place, and only `ui/` is allowed to know about Slint at
+    // all — so the worker can't live in `app` (which must stay
+    // `slint`-free) or be reached through `AppState::dispatch` (nothing
+    // about a running search is a synchronous state transition; only its
+    // start and its eventual completion are, and both already go through
+    // `AppState` via `Action::StartFind`/`complete_find`).
+    std::thread::spawn(move || {
+        let result =
+            crate::core::find::find_recursive(&root, &query, include_hidden, FIND_MAX_RESULTS);
+        let _ = tx.send(FindCompletion { generation, result });
+        let _ = ui_weak.upgrade_in_event_loop(|ui| {
+            ui.invoke_find_completion_ready();
+        });
+    });
+}
+
 fn full_refresh_current(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     let (rows, path_text, status_text, mode_text, index) = {
         let st = state.borrow();
-        let visible = st.visible_entries();
-        let rows: Vec<EntryRow> = visible
-            .iter()
-            .map(|entry| EntryRow {
-                text: row_label(entry).into(),
-                icon: entry_icon(entry.kind()).into(),
-            })
-            .collect();
         let path_text = st.current_dir().display().to_string();
-        let query = st.filter_query();
-        // FILTER never re-counts the directory from the filesystem: both
-        // numbers below are lengths of lists already in memory
-        // (`visible_entries()`/`entries()`), not a fresh read.
-        let status_text = if query.is_empty() {
-            format!("{} items", st.entries().len())
+        let (rows, status_text, mode_text, index) = if let Some(session) = st.find_session() {
+            find_current_view(session)
         } else {
-            format!("{} / {} items", visible.len(), st.entries().len())
+            let visible = st.visible_entries();
+            let rows: Vec<EntryRow> = visible
+                .iter()
+                .map(|entry| EntryRow {
+                    text: row_label(entry).into(),
+                    icon: entry_icon(entry.kind()).into(),
+                })
+                .collect();
+            let query = st.filter_query();
+            // FILTER never re-counts the directory from the filesystem:
+            // both numbers below are lengths of lists already in memory
+            // (`visible_entries()`/`entries()`), not a fresh read.
+            let status_text = if query.is_empty() {
+                format!("{} items", st.entries().len())
+            } else {
+                format!("{} / {} items", visible.len(), st.entries().len())
+            };
+            let mode_text = if query.is_empty() {
+                "NORMAL".to_string()
+            } else {
+                format!("FILTER: {query}")
+            };
+            let index = st.visible_selected_index().map(|i| i as i32).unwrap_or(-1);
+            (rows, status_text, mode_text, index)
         };
-        let mode_text = if query.is_empty() {
-            "NORMAL".to_string()
-        } else {
-            format!("FILTER: {query}")
-        };
-        let index = st.visible_selected_index().map(|i| i as i32).unwrap_or(-1);
         (rows, path_text, status_text, mode_text, index)
         // `st` (the borrow) is dropped here, before any `ui`/`invoke_*` call.
     };
@@ -338,12 +544,79 @@ fn full_refresh_current(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     ui.invoke_scroll_to_index(index);
 }
 
+/// FIND's contribution to CURRENT: rows (relative-path labels — see
+/// [`find_result_label`]), status text, mode text, and selected index, for
+/// whichever [`crate::app::FindPhase`] `session` is currently in. PARENT is
+/// never touched by any of this (`full_refresh_current`'s caller never
+/// calls `refresh_parent` for FIND states) — current_dir/PARENT stay
+/// exactly the real directory's, per §12.
+fn find_current_view(session: &crate::app::FindSession) -> (Vec<EntryRow>, String, String, i32) {
+    let mode_text = format!("FIND: {}", session.query());
+    match session.phase() {
+        FindPhase::Searching => (Vec::new(), "searching...".to_string(), mode_text, -1),
+        FindPhase::Error(message) => {
+            // Kept short and on one line deliberately (§13): the status
+            // bar is 24px tall and single-row, never a place to dump a
+            // full `io::Error` message.
+            let _ = message; // available if a future milestone wants it surfaced
+            (Vec::new(), "ERROR".to_string(), mode_text, -1)
+        }
+        FindPhase::Ready(ready) => {
+            let rows: Vec<EntryRow> = ready
+                .results
+                .iter()
+                .map(|entry| EntryRow {
+                    text: find_result_label(entry, session.root()).into(),
+                    icon: entry_icon(entry.kind()).into(),
+                })
+                .collect();
+            let mut status_text = format!("{} results", ready.results.len());
+            // `truncated` means the search stopped at `FIND_MAX_RESULTS`,
+            // never that another match was proven to exist beyond it — so
+            // this deliberately never renders as "N+" (see
+            // `FindReady::truncated`'s own doc comment).
+            if ready.truncated {
+                status_text.push_str(" · limit reached");
+            }
+            if ready.skipped_count > 0 {
+                status_text.push_str(&format!(" · {} skipped", ready.skipped_count));
+            }
+            let index = ready.selected.map(|i| i as i32).unwrap_or(-1);
+            (rows, status_text, mode_text, index)
+        }
+    }
+}
+
+/// FIND's row label: the result's path *relative to the search root*
+/// (§11) — never the bare basename, since two results from different
+/// subtrees can share one (`src/main.rs` vs. `docs/main-notes.md`).
+/// `strip_prefix` failing (defensive only — every result comes from
+/// `core::find::find_recursive(root, ..)`, so it should never actually
+/// fail) falls back to the full path rather than panicking or discarding
+/// the result; either way this only ever affects *presentation* — identity
+/// stays `entry.path()`, untouched. A trailing "/" for directories, same
+/// convention as `row_label`.
+fn find_result_label(entry: &FileEntry, root: &Path) -> String {
+    let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+    let mut label = relative.to_string_lossy().into_owned();
+    if entry.kind() == EntryKind::Directory {
+        label.push('/');
+    }
+    label
+}
+
 fn sync_selection(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
-    let index = state
-        .borrow()
-        .visible_selected_index()
-        .map(|i| i as i32)
-        .unwrap_or(-1);
+    let index = {
+        let st = state.borrow();
+        if let Some(session) = st.find_session() {
+            match session.phase() {
+                FindPhase::Ready(ready) => ready.selected.map(|i| i as i32).unwrap_or(-1),
+                FindPhase::Searching | FindPhase::Error(_) => -1,
+            }
+        } else {
+            st.visible_selected_index().map(|i| i as i32).unwrap_or(-1)
+        }
+    };
     ui.set_current_index(index);
     ui.invoke_scroll_to_index(index);
 }
@@ -711,5 +984,77 @@ mod tests {
         let rows = preview_text_rows("a\n\nb");
 
         assert_eq!(row_texts(&rows), vec!["a", "", "b"]);
+    }
+
+    // --- FIND presentation (M5T-B2) ----------------------------------------
+
+    #[test]
+    fn find_result_label_shows_path_relative_to_root() {
+        let dir = crate::test_support::TempDir::new();
+        let sub = dir.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        let file = sub.join("main.rs");
+        std::fs::write(&file, b"").unwrap();
+        let entry = FileEntry::from_path(file).unwrap();
+
+        assert_eq!(find_result_label(&entry, dir.path()), "src/main.rs");
+    }
+
+    #[test]
+    fn find_result_label_distinguishes_same_basename_in_different_dirs() {
+        let dir = crate::test_support::TempDir::new();
+        let src = dir.path().join("src");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(src.join("main.rs"), b"").unwrap();
+        std::fs::write(docs.join("main.rs"), b"").unwrap();
+        let a = FileEntry::from_path(src.join("main.rs")).unwrap();
+        let b = FileEntry::from_path(docs.join("main.rs")).unwrap();
+
+        assert_ne!(
+            find_result_label(&a, dir.path()),
+            find_result_label(&b, dir.path())
+        );
+    }
+
+    #[test]
+    fn find_result_label_adds_trailing_slash_for_directories() {
+        let dir = crate::test_support::TempDir::new();
+        let sub = dir.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        let entry = FileEntry::from_path(sub).unwrap();
+
+        assert_eq!(find_result_label(&entry, dir.path()), "src/");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_result_label_does_not_panic_on_non_utf8_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::test_support::TempDir::new();
+        let name = OsStr::from_bytes(b"main-\xFF.txt");
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"").unwrap();
+        let entry = FileEntry::from_path(path).unwrap();
+
+        // Must not panic; presentation-only, identity is untouched.
+        let label = find_result_label(&entry, dir.path());
+
+        assert!(!label.is_empty());
+    }
+
+    #[test]
+    fn row_label_still_shows_bare_basename_for_normal_filter_rows() {
+        // FIND's relative-path labels (above) must never leak into the
+        // normal/FILTER row builder — CURRENT outside FIND keeps showing
+        // exactly the basename it always has.
+        let dir = crate::test_support::TempDir::new();
+        let sub = dir.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        let entry = FileEntry::from_path(sub).unwrap();
+
+        assert_eq!(row_label(&entry), "src/");
     }
 }
