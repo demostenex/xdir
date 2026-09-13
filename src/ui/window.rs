@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, ModelRc, VecModel};
 
-use crate::app::{Action, AppState, FIND_MAX_RESULTS, FilePreview, FindPhase, PreviewContext};
+use crate::app::{
+    Action, AppState, CreateOutcome, FIND_MAX_RESULTS, FilePreview, FindPhase, PreviewContext,
+    RenameOutcome, Update,
+};
 use crate::model::{EntryKind, FileEntry};
 use crate::ui::input::{KeyStroke, Keymap, KeymapResult};
 
@@ -26,6 +29,16 @@ struct FindCompletion {
 slint::include_modules!();
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// The exact prefix `on_create_accepted` writes to `status-text` on
+/// `CreateOutcome::Failed`, and the one thing `on_create_edited` (M5T-C2 V2
+/// audit fix #2) checks for before clearing it — a shared `const` so the
+/// two can never drift apart into checking for a message the other one
+/// doesn't actually write.
+const CREATE_ERROR_PREFIX: &str = "create failed: ";
+
+/// Mirrors [`CREATE_ERROR_PREFIX`] for RENAME's own error message.
+const RENAME_ERROR_PREFIX: &str = "rename failed: ";
 
 /// What a press should do, decided purely from click history — no
 /// filesystem/AppState knowledge here, just the timing/index/button rule.
@@ -197,6 +210,22 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
                     begin_find_edit(&state, &ui);
                     true
                 }
+                // `a`: opens CREATE's editor, unless FIND is currently
+                // active (a deliberate no-op then — see
+                // `begin_create_edit`'s own doc comment). Either way the
+                // keystroke is still ours to consume, not the window
+                // manager's.
+                KeymapResult::EnterCreate => {
+                    begin_create_edit(&state, &ui);
+                    true
+                }
+                // `r`: opens RENAME's editor, unless FIND is active, nothing
+                // is selected, or the selection's basename isn't valid
+                // UTF-8 (all deliberate no-ops — see `begin_rename_edit`).
+                KeymapResult::EnterRename => {
+                    begin_rename_edit(&state, &ui);
+                    true
+                }
                 KeymapResult::Unhandled => false,
             }
         }
@@ -279,6 +308,173 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
             apply(&state, &ui, Action::ClearFind);
             ui.set_find_editing(false);
             ui.invoke_focus_list();
+        }
+    });
+
+    // Enter, while CREATE is being edited: unlike FILTER, this reaches the
+    // filesystem synchronously (CREATE never spawns a worker — see
+    // `begin_create_edit`'s own doc comment on why this stays a plain,
+    // synchronous call, unlike FIND). An empty draft is `Cancelled` (closes
+    // the editor, no filesystem call at all); success closes the editor and
+    // applies the resulting `Update`; failure leaves the editor open with
+    // its draft intact and surfaces the OS error text through
+    // `status-text` — the exact spot FIND's own `Searching`/`Error`
+    // messages already use (see `find_current_view`), reused here rather
+    // than inventing a second place to show a transient message.
+    ui.on_create_accepted({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            let input = ui.get_create_query().to_string();
+            // `outcome` must be bound to a local before matching on it:
+            // matching directly on `state.borrow_mut().create_entry(&input)`
+            // would keep that `RefMut` alive for the whole match (a
+            // scrutinee's temporaries live until the match ends), and the
+            // `Created` arm below itself needs `state.borrow()` again via
+            // `apply_update` — exactly the reentrant-`RefCell` hazard
+            // `apply`'s own doc comment describes.
+            let outcome = state.borrow_mut().create_entry(&input);
+            match outcome {
+                CreateOutcome::Cancelled => {
+                    // Nothing for `AppState` to apply — but `status-text`
+                    // may already be blank (M5T-C2 V2 audit fix #2's
+                    // `on_create_edited` clears it the moment a stale error
+                    // starts being edited, including all the way down to
+                    // the empty draft that lands here). `apply_update`
+                    // would never touch it for a no-op, so this restores it
+                    // explicitly rather than closing the editor over a
+                    // blank status line.
+                    full_refresh_current(&state, &ui);
+                    ui.set_create_editing(false);
+                    ui.invoke_focus_list();
+                }
+                CreateOutcome::Created(update) => {
+                    apply_update(&state, &ui, update);
+                    ui.set_create_editing(false);
+                    ui.invoke_focus_list();
+                }
+                CreateOutcome::Failed(message) => {
+                    ui.set_status_text(format!("{CREATE_ERROR_PREFIX}{message}").into());
+                }
+            }
+        }
+    });
+
+    // Every keystroke while CREATE's draft is being edited (M5T-C2 V2 audit
+    // fix #2): a stale "create failed: ..." message from a previous
+    // rejected attempt must not survive the user starting to fix it.
+    // Deliberately the smallest possible reaction to `create-edited` — no
+    // `AppState` call, no filesystem I/O, no `full_refresh_current` (that
+    // would resync CURRENT/scroll/PREVIEW for literally every keystroke,
+    // none of which changed) — just clearing `status-text` back to empty
+    // when it's currently showing *this* editor's own stale error, and
+    // leaving it alone otherwise (so a keystroke right after opening the
+    // editor, with no prior failure, doesn't blank the item-count text for
+    // no reason). Focus is never touched here: the input keeps it exactly
+    // as it already does while being typed into.
+    ui.on_create_edited({
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            if ui.get_status_text().starts_with(CREATE_ERROR_PREFIX) {
+                ui.set_status_text(String::new().into());
+            }
+        }
+    });
+
+    // Esc, while CREATE is being edited: discards the draft and closes the
+    // editor without ever calling `AppState` — nothing about CREATE has a
+    // "committed" state the way FILTER/FIND do, so there is nothing to
+    // clear beyond the UI's own draft/editing flags.
+    ui.on_create_escaped({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            ui.set_create_editing(false);
+            ui.set_create_query(String::new().into());
+            ui.invoke_focus_list();
+            // Restores whatever `status-text` should show normally — undoes
+            // a stale `CreateOutcome::Failed` message left over from a
+            // rejected attempt right before this Esc.
+            full_refresh_current(&state, &ui);
+        }
+    });
+
+    // Enter, while RENAME is being edited: same synchronous shape as
+    // CREATE's own `on_create_accepted` above, calling
+    // `AppState::rename_selected` instead. There is no "empty cancels"
+    // case here — RENAME's editor is always pre-filled with a real,
+    // non-empty basename (see `begin_rename_edit`), so an empty draft is
+    // simply an invalid new name and reaches `RenameOutcome::Failed` like
+    // any other rejected name, never a special `Cancelled` path.
+    ui.on_rename_accepted({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            let input = ui.get_rename_query().to_string();
+            let outcome = state.borrow_mut().rename_selected(&input);
+            match outcome {
+                RenameOutcome::NoSelection => {
+                    // Defensive only — `r` never opens this editor without
+                    // a selection (see `begin_rename_edit`) — but still
+                    // closes the editor rather than leaving it stuck open
+                    // over a state this method itself found nothing to act
+                    // on.
+                    ui.set_rename_editing(false);
+                    ui.invoke_focus_list();
+                }
+                RenameOutcome::Renamed(update) => {
+                    apply_update(&state, &ui, update);
+                    // A same-basename success carries `Update::NONE` (see
+                    // `AppState::rename_selected`'s own doc comment) — a
+                    // real no-op `apply_update` never touches
+                    // `status-text` for, so restore it explicitly here too,
+                    // for the exact reason `CreateOutcome::Cancelled`'s own
+                    // arm above does: an edit right after a conflict (e.g.
+                    // typing back to the original name) already cleared it
+                    // via `on_rename_edited`, and nothing else would
+                    // otherwise put it back before the editor closes.
+                    if update == Update::default() {
+                        full_refresh_current(&state, &ui);
+                    }
+                    ui.set_rename_editing(false);
+                    ui.invoke_focus_list();
+                }
+                RenameOutcome::Failed(message) => {
+                    ui.set_status_text(format!("{RENAME_ERROR_PREFIX}{message}").into());
+                }
+            }
+        }
+    });
+
+    // Mirrors `on_create_edited` above for the exact same reason (M5T-C2 V2
+    // audit fix #2): clears a stale "rename failed: ..." message on the
+    // next keystroke, and does nothing else.
+    ui.on_rename_edited({
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            if ui.get_status_text().starts_with(RENAME_ERROR_PREFIX) {
+                ui.set_status_text(String::new().into());
+            }
+        }
+    });
+
+    // Esc, while RENAME is being edited: discards the draft and closes the
+    // editor, same shape as CREATE's own `on_create_escaped`. The real
+    // entry on disk is completely untouched either way.
+    ui.on_rename_escaped({
+        let state = state.clone();
+        let ui = ui.as_weak();
+        move || {
+            let ui = ui.unwrap();
+            ui.set_rename_editing(false);
+            ui.set_rename_query(String::new().into());
+            ui.invoke_focus_list();
+            full_refresh_current(&state, &ui);
         }
     });
 
@@ -424,6 +620,57 @@ fn begin_find_edit(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     ui.set_find_query(query.into());
     ui.set_find_editing(true);
     ui.invoke_focus_find_input();
+}
+
+/// Shows CREATE's input box and moves keyboard focus to it, always starting
+/// from an empty draft (unlike FILTER/FIND, there is no "committed query"
+/// to reopen — every CREATE is a fresh, one-shot request). A no-op while
+/// FIND is active (§ the milestone's frozen rule that CREATE/RENAME are
+/// only available in the NORMAL/FILTER views): `AppState` is left
+/// completely untouched, and — unlike `begin_filter_edit`'s own `/` — this
+/// does not clear FIND either, since CREATE has nothing to show "underneath"
+/// FIND's results that would justify dismissing them.
+fn begin_create_edit(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+    if state.borrow().find_session().is_some() {
+        return;
+    }
+    ui.set_create_query(String::new().into());
+    ui.set_create_editing(true);
+    ui.invoke_focus_create_input();
+}
+
+/// `AppState::rename_selected`'s UI-boundary guard for opening RENAME's
+/// editor at all: `Some` only when `entry`'s basename is valid UTF-8 —
+/// Slint's `TextInput` (and so `rename-query`) can only ever hold that.
+/// Never a lossy conversion (`to_string_lossy`): silently offering to
+/// rename a non-UTF-8 entry to a replacement-character-laden name that
+/// doesn't match its real bytes would be worse than simply refusing to open
+/// the editor for it at all. A pure function, independent of any `slint`
+/// type, so it's unit-testable without a running `MainWindow`.
+fn rename_prefill_name(entry: &FileEntry) -> Option<String> {
+    entry.name().to_str().map(str::to_string)
+}
+
+/// Shows RENAME's input box, pre-filled with the selected entry's exact
+/// current basename, and moves keyboard focus to it. A no-op — `AppState`
+/// and the UI's `rename-*` properties both left completely untouched — in
+/// every case that shouldn't open the editor at all: FIND active (same rule
+/// as `begin_create_edit`), nothing selected, or a selection whose basename
+/// isn't valid UTF-8 ([`rename_prefill_name`] returning `None`).
+fn begin_rename_edit(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
+    let prefill = {
+        let st = state.borrow();
+        if st.find_session().is_some() {
+            return;
+        }
+        st.selected_entry().and_then(rename_prefill_name)
+    };
+    let Some(prefill) = prefill else {
+        return;
+    };
+    ui.set_rename_query(prefill.into());
+    ui.set_rename_editing(true);
+    ui.invoke_focus_rename_input();
 }
 
 /// Commits `query` (already confirmed non-empty by `on_find_accepted`) and
@@ -1043,6 +1290,53 @@ mod tests {
         let label = find_result_label(&entry, dir.path());
 
         assert!(!label.is_empty());
+    }
+
+    // --- RENAME UI-boundary (M5T-C2) ---------------------------------------
+
+    #[test]
+    fn rename_prefill_name_returns_the_utf8_basename() {
+        let dir = crate::test_support::TempDir::new();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, b"").unwrap();
+        let entry = FileEntry::from_path(path).unwrap();
+
+        assert_eq!(rename_prefill_name(&entry), Some("plain.txt".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_prefill_name_rejects_a_non_utf8_basename() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::test_support::TempDir::new();
+        let name = OsStr::from_bytes(b"broken-\xFF.txt");
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"").unwrap();
+        let entry = FileEntry::from_path(path).unwrap();
+
+        assert_eq!(rename_prefill_name(&entry), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_prefill_name_never_lossily_substitutes_a_replacement_character() {
+        // The exact failure mode this must never fall into: a lossy
+        // conversion would still return `Some(String)` here (with U+FFFD in
+        // it), silently offering to rename the entry to a name that doesn't
+        // match its real bytes. Only a `None` — refusing to open the editor
+        // at all — is correct.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::test_support::TempDir::new();
+        let name = OsStr::from_bytes(b"\xFF\xFE");
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"").unwrap();
+        let entry = FileEntry::from_path(path).unwrap();
+
+        let result = rename_prefill_name(&entry);
+
+        assert!(result.is_none(), "expected None, got {result:?}");
     }
 
     #[test]

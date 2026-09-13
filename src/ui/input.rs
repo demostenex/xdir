@@ -195,6 +195,21 @@ pub(crate) enum KeymapResult {
     /// pending `g`, via `resolve_pending_go`'s catch-all — never opens
     /// FIND on that same keystroke).
     EnterFind,
+    /// `a` in `Normal` (M5T-C2): opens CREATE's editor — same non-`Action`
+    /// shape as `EnterFilter`/`EnterFind` (opening the box changes nothing
+    /// in `AppState`; only Enter, via `AppState::create_entry`, does). Same
+    /// `PendingGo` exclusion: `g a` only ever cancels the pending `g`
+    /// (`resolve_pending_go`'s catch-all), never opens CREATE on that same
+    /// keystroke. `ui/window.rs` alone decides whether this is actually
+    /// honored right now (it is a no-op while FIND is active — see
+    /// `begin_create_edit`); the keymap itself has no notion of FIND at all.
+    EnterCreate,
+    /// `r` in `Normal` (M5T-C2): the RENAME counterpart of `EnterCreate` —
+    /// same reasoning, same `PendingGo` exclusion, same "`ui/window.rs`
+    /// decides whether it's actually honored" caveat (RENAME additionally
+    /// requires a selection with a UTF-8 basename — see
+    /// `begin_rename_edit`/`rename_prefill_name`).
+    EnterRename,
     /// This keystroke means nothing to xdir at all (an unbound key, or one
     /// carrying a modifier xdir never claims) — left alone for the window
     /// manager or ignored outright.
@@ -266,6 +281,12 @@ impl Keymap {
             // — see `KeymapResult::EnterFind`. Same `PendingGo` exclusion
             // as `/`.
             Key::Char('f') => KeymapResult::EnterFind,
+            // Opens CREATE's editor — see `KeymapResult::EnterCreate`. Same
+            // `PendingGo` exclusion as `/`/`f`.
+            Key::Char('a') => KeymapResult::EnterCreate,
+            // Opens RENAME's editor — see `KeymapResult::EnterRename`. Same
+            // `PendingGo` exclusion as `/`/`f`/`a`.
+            Key::Char('r') => KeymapResult::EnterRename,
             // `Esc` in `Normal`: cancels whichever transient view is on
             // top — FIND before FILTER, or does nothing if neither is
             // active — always consumed either way, the same way every
@@ -725,8 +746,11 @@ mod tests {
         // `/` was reserved here through M5V; M5T-A (FILTER) implements it
         // — see `slash_enters_filter_mode` — so it moved out of this list.
         // `f` was reserved through M5T-A; M5T-B2 (FIND) implements it —
-        // see `f_enters_find_mode` — so it moves out too.
-        for raw in ["a", "r", "y", "x", "p", "d", " "] {
+        // see `f_enters_find_mode` — so it moves out too. `a`/`r` were
+        // reserved through M5T-C1; M5T-C2 (CREATE/RENAME) implements them —
+        // see `a_enters_create_mode`/`r_enters_rename_mode` — so they move
+        // out too.
+        for raw in ["y", "x", "p", "d", " "] {
             let mut keymap = Keymap::new();
             assert_eq!(
                 keymap.resolve(plain(raw)),
@@ -795,5 +819,47 @@ mod tests {
         // The *next*, fresh `f` (Normal again, no pending prefix) does open
         // FIND — the cancelled one was never silently reinterpreted.
         assert_eq!(keymap.resolve(plain("f")), KeymapResult::EnterFind);
+    }
+
+    // --- CREATE / RENAME (M5T-C2) ------------------------------------------
+
+    #[test]
+    fn a_enters_create_mode() {
+        assert_eq!(resolve_once("a"), KeymapResult::EnterCreate);
+    }
+
+    #[test]
+    fn a_during_pending_go_only_cancels_prefix() {
+        let mut keymap = Keymap::new();
+        keymap.resolve(plain("g"));
+
+        // `a` is not a valid continuation of `g`: the whole `g a` sequence
+        // cancels, exactly like any other invalid continuation — it must
+        // never itself open CREATE on this same keystroke.
+        assert_eq!(keymap.resolve(plain("a")), KeymapResult::Cancelled);
+
+        // The *next*, fresh `a` (Normal again, no pending prefix) does open
+        // CREATE — the cancelled one was never silently reinterpreted.
+        assert_eq!(keymap.resolve(plain("a")), KeymapResult::EnterCreate);
+    }
+
+    #[test]
+    fn r_enters_rename_mode() {
+        assert_eq!(resolve_once("r"), KeymapResult::EnterRename);
+    }
+
+    #[test]
+    fn r_during_pending_go_only_cancels_prefix() {
+        let mut keymap = Keymap::new();
+        keymap.resolve(plain("g"));
+
+        // `r` is not a valid continuation of `g`: the whole `g r` sequence
+        // cancels, exactly like any other invalid continuation — it must
+        // never itself open RENAME on this same keystroke.
+        assert_eq!(keymap.resolve(plain("r")), KeymapResult::Cancelled);
+
+        // The *next*, fresh `r` (Normal again, no pending prefix) does open
+        // RENAME — the cancelled one was never silently reinterpreted.
+        assert_eq!(keymap.resolve(plain("r")), KeymapResult::EnterRename);
     }
 }

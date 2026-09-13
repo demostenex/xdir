@@ -174,6 +174,44 @@ export component MainWindow inherits Window {
     // it already owns.
     callback find-completion-ready();
 
+    // CREATE (M5T-C2): a new file (or, when the typed text ends with `/`, a
+    // directory) inside `current_dir`. Same UI-draft shape as `find-query`
+    // above, not FILTER's live-updating one: nothing about typing here
+    // reaches `AppState` or the filesystem until Enter
+    // (`create-accepted`), via `AppState::create_entry`. `create-editing`
+    // mirrors `filter-editing`/`find-editing`; by construction only one of
+    // `filter-editing`/`find-editing`/`create-editing`/`rename-editing` is
+    // ever `true` at a time (`ui/window.rs` never opens a second editor
+    // while another is showing).
+    in-out property <string> create-query: "";
+    in property <bool> create-editing: false;
+    callback create-accepted();
+    callback create-escaped();
+    // M5T-C2 V2 audit fix #2: fired on every keystroke while the draft is
+    // being edited (mirroring `filter-edited`'s per-keystroke shape, not
+    // `find-input`'s Enter-only one) — its *only* job is letting
+    // `ui/window.rs` clear a stale "create failed: ..." message left in
+    // `status-text` by a previous rejected attempt. It carries no text of
+    // its own (unlike `filter-edited`): the draft is already readable back
+    // through `create-query`'s own two-way binding whenever it's actually
+    // needed (at Enter time), so this is deliberately just a bare wakeup.
+    callback create-edited();
+
+    // RENAME (M5T-C2): the selected entry's basename, editable in place.
+    // `ui/window.rs` pre-fills `rename-query` with the exact current
+    // basename before setting `rename-editing: true` (never lossily —
+    // opening is refused outright for a non-UTF-8 basename; see
+    // `rename_prefill_name`). Same draft/callback shape as `create-query`
+    // above.
+    in-out property <string> rename-query: "";
+    in property <bool> rename-editing: false;
+    callback rename-accepted();
+    callback rename-escaped();
+    // Mirrors `create-edited` above for the exact same reason (M5T-C2 V2
+    // audit fix #2): clears a stale "rename failed: ..." message on the
+    // next keystroke.
+    callback rename-edited();
+
     // UI never touches the filesystem or Navigation, and never decides
     // what a keystroke or click *means* — it only reports what happened.
     // `key-input` forwards the pressed key's raw text (or, for the arrow
@@ -233,6 +271,18 @@ export component MainWindow inherits Window {
     // instantiated (never behind an `if`) for this to resolve its id.
     public function focus-find-input() {
         find-input.focus();
+    }
+
+    // Mirrors `focus-filter-input()` for CREATE's own box — same
+    // "always instantiated, never behind `if`" reasoning.
+    public function focus-create-input() {
+        create-input.focus();
+    }
+
+    // Mirrors `focus-filter-input()` for RENAME's own box — same
+    // "always instantiated, never behind `if`" reasoning.
+    public function focus-rename-input() {
+        rename-input.focus();
     }
 
     VerticalLayout {
@@ -673,8 +723,8 @@ export component MainWindow inherits Window {
                     // <query>" + `status-text` "searching..." while
                     // Searching — see `ui/window.rs::full_refresh_current`)
                     // exactly the same way it carries FILTER's, so this
-                    // only needs to hide while *either* box is open.
-                    visible: !root.filter-editing && !root.find-editing;
+                    // only needs to hide while any editor box is open.
+                    visible: !root.filter-editing && !root.find-editing && !root.create-editing && !root.rename-editing;
                 }
                 Text {
                     x: 0px;
@@ -689,6 +739,20 @@ export component MainWindow inherits Window {
                     color: Tokens.text-secondary;
                     vertical-alignment: center;
                     visible: root.find-editing;
+                }
+                Text {
+                    x: 0px;
+                    text: "CREATE";
+                    color: Tokens.text-secondary;
+                    vertical-alignment: center;
+                    visible: root.create-editing;
+                }
+                Text {
+                    x: 0px;
+                    text: "RENAME";
+                    color: Tokens.text-secondary;
+                    vertical-alignment: center;
+                    visible: root.rename-editing;
                 }
                 // Bare `TextInput`, not `LineEdit`: M5V removed
                 // `StandardListView` specifically because a styled
@@ -756,6 +820,59 @@ export component MainWindow inherits Window {
                     key-pressed(event) => {
                         if (event.text == Key.Escape) {
                             root.find-escaped();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+                // CREATE's own box (M5T-C2): same primitive, same slot/
+                // geometry, same "always instantiated, never behind `if`"
+                // reasoning as `filter-input`/`find-input` above.
+                // `edited` (M5T-C2 V2 audit fix #2) exists purely to let
+                // `ui/window.rs` clear a stale error message — `Enter` is
+                // still the only thing that reads the draft back
+                // (`create-query`'s own two-way binding is enough for
+                // that).
+                create-input := TextInput {
+                    x: 55px;
+                    y: 0px;
+                    height: parent.height;
+                    width: parent.width - self.x;
+                    visible: root.create-editing;
+                    text <=> root.create-query;
+                    single-line: true;
+                    color: Tokens.text-primary;
+                    vertical-alignment: center;
+                    edited => { root.create-edited(); }
+                    accepted => { root.create-accepted(); }
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.create-escaped();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+                // RENAME's own box (M5T-C2): same shape as `create-input`
+                // above, pre-filled by `ui/window.rs` with the selected
+                // entry's current basename before `rename-editing` is set.
+                rename-input := TextInput {
+                    x: 55px;
+                    y: 0px;
+                    height: parent.height;
+                    width: parent.width - self.x;
+                    visible: root.rename-editing;
+                    text <=> root.rename-query;
+                    single-line: true;
+                    color: Tokens.text-primary;
+                    vertical-alignment: center;
+                    edited => { root.rename-edited(); }
+                    accepted => { root.rename-accepted(); }
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.rename-escaped();
                             accept
                         } else {
                             reject

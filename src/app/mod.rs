@@ -6,4 +6,7 @@ mod state;
 pub use action::Action;
 pub use context::{ParentContext, PreviewContext};
 pub use preview::FilePreview;
-pub use state::{AppState, FIND_MAX_RESULTS, FindPhase, FindReady, FindSession, Update};
+pub use state::{
+    AppState, CreateOutcome, FIND_MAX_RESULTS, FindPhase, FindReady, FindSession, RenameOutcome,
+    Update,
+};

@@ -1,9 +1,11 @@
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::app::{Action, ParentContext, PreviewContext};
 use crate::core::find::FindOutcome;
 use crate::core::navigation::Navigation;
+use crate::core::operations::{self, CreateKind};
 use crate::core::places::{self, Place, SystemPlaceKind};
 use crate::model::{EntryKind, FileEntry};
 
@@ -52,6 +54,55 @@ impl Update {
             preview_changed: self.preview_changed || other.preview_changed,
         }
     }
+}
+
+/// What [`AppState::create_entry`] did. Not `io::Result<Update>`: CREATE
+/// isn't reached through `dispatch`/`Action` at all (see that method's own
+/// doc comment for why — the same reasoning `complete_find` already
+/// documents for FIND), so nothing forces it to share `dispatch`'s
+/// `Update`-only return shape. `ui/window.rs` matches on this directly to
+/// decide whether to close the editor and what, if anything, to show.
+#[derive(Debug)]
+pub enum CreateOutcome {
+    /// The input was exactly the empty string: no filesystem call was even
+    /// attempted. The caller closes the editor exactly as if Esc had been
+    /// pressed — this is a deliberate "cancel", never an error.
+    Cancelled,
+    /// `core::operations::create_entry` succeeded: apply this `Update` and
+    /// close the editor.
+    Created(Update),
+    /// `core::operations::create_entry` failed. Nothing in `AppState` was
+    /// touched (the error is returned before any mutation), so the editor,
+    /// its draft text, and the filesystem are all exactly as they were —
+    /// the caller keeps the editor open and only needs to surface this
+    /// message. Already `io::Error::to_string()`, never the `io::Error`
+    /// itself, for the same reason [`FindPhase::Error`] stores a `String`
+    /// (see its own doc comment): `AppState`'s public surface stays free of
+    /// `io::Error` as a stored type.
+    Failed(String),
+}
+
+/// What [`AppState::rename_selected`] did. Same shape and reasoning as
+/// [`CreateOutcome`].
+#[derive(Debug)]
+pub enum RenameOutcome {
+    /// Nothing was selected when this was called. `ui/window.rs` never
+    /// actually opens RENAME's editor without a selection (`r` itself
+    /// requires one), so this should be unreachable in practice — handled
+    /// explicitly anyway rather than silently doing nothing unaccounted-for.
+    NoSelection,
+    /// `core::operations::rename_entry` succeeded. A same-basename rename
+    /// (a deliberate no-op in the core — see `rename_entry`'s own doc
+    /// comment) always carries `Update::NONE` here: nothing on disk or in
+    /// the listing actually changed, so this never reloads `entries` or
+    /// rebuilds PREVIEW for that case.
+    Renamed(Update),
+    /// `core::operations::rename_entry` failed. Same guarantee as
+    /// [`CreateOutcome::Failed`]: nothing in `AppState` was touched, and
+    /// `core::operations::rename_entry` itself never mutates the filesystem
+    /// on an error path (see its own doc comment) — editor, draft, and the
+    /// real file/directory are all left exactly as they were.
+    Failed(String),
 }
 
 /// FIND's result set once a search completes successfully. A deliberately
@@ -806,6 +857,170 @@ impl AppState {
             self.clear_find()
         } else {
             self.clear_filter()
+        }
+    }
+
+    /// Creates a new file or (if `raw_input` ends with `/`) directory inside
+    /// `current_dir`, from CREATE's editor text — called from
+    /// `ui/window.rs`'s `on_create_accepted`, never from a `dispatch`/
+    /// `Action` path: nothing about running `core::operations::create_entry`
+    /// is a plain synchronous keystroke transition the way every `Action`
+    /// variant is, and forcing `dispatch` itself to return `io::Result`
+    /// would mean every other, purely in-memory `Action` carrying that
+    /// shape too for a single caller's benefit. `raw_input` is used exactly
+    /// as typed — never trimmed — so a name with meaningful leading/
+    /// trailing spaces is preserved verbatim; only a *literally* empty
+    /// string is special-cased as [`CreateOutcome::Cancelled`] before any
+    /// filesystem call is even attempted. Available only while CREATE's
+    /// editor is open, which `ui/window.rs` itself never opens while FIND
+    /// is active (see `begin_create_edit`) — this method has no FIND
+    /// awareness of its own and does not need any: it only ever touches
+    /// `entries`/`selected`/PREVIEW, exactly like `toggle_hidden`.
+    pub fn create_entry(&mut self, raw_input: &str) -> CreateOutcome {
+        if raw_input.is_empty() {
+            return CreateOutcome::Cancelled;
+        }
+        let kind = if raw_input.ends_with('/') {
+            CreateKind::Directory
+        } else {
+            CreateKind::File
+        };
+        let relative = Path::new(raw_input);
+        match operations::create_entry(self.navigation.current_dir(), relative, kind) {
+            Ok(created_path) => {
+                let previous_preview_source = self.preview_source_identity();
+                // M5T-C2 V2 audit fix #1: identity alone (compared below by
+                // `finish_preview_transition`) misses the one case where
+                // PREVIEW's *source* doesn't change at all but its
+                // *content* does — creating something directly inside the
+                // very directory PREVIEW is already showing. Read *before*
+                // `entries`/`selected` are touched: `created_path`'s parent
+                // is compared against the currently-previewed directory's
+                // own path, both real `PathBuf`s, never a presentation
+                // string. `EntryKind::Directory` is required (not, say,
+                // `Symlink`-to-directory) because that's exactly what
+                // `PreviewContext::Directory` itself requires to have
+                // listed `created_path`'s parent's children in the first
+                // place.
+                let created_inside_previewed_directory = matches!(
+                    self.current_preview_source(),
+                    Some(entry)
+                        if entry.kind() == EntryKind::Directory
+                            && created_path.parent() == Some(entry.path())
+                );
+                // M5T-C2 V3 audit fix: captured *before* `entries`/
+                // `selected` are touched, by real path identity — never an
+                // index (reload/sort can renumber it) and never a
+                // presentation string/basename. When `created_path` is a
+                // *nested* path (`dir/new.txt`), it is never itself a
+                // top-level entry of `current_dir`, so the lookup just
+                // below always misses for it; without this fallback the
+                // selection then fell straight through to
+                // `initial_selection` — jumping to the first entry for no
+                // reason, even though nothing about the top-level listing
+                // (or what should stay selected in it) actually changed.
+                let previous_selected_path = self
+                    .selected_entry()
+                    .map(|entry| entry.path().to_path_buf());
+                self.entries = self.navigation.entries().unwrap_or_default();
+                self.selected = self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.path() == created_path.as_path())
+                    .or_else(|| {
+                        // Only reached when `created_path` isn't itself a
+                        // top-level entry (a nested create) — a direct
+                        // create always resolves in the branch above and
+                        // never falls through to preserving the *previous*
+                        // selection instead.
+                        previous_selected_path.as_ref().and_then(|path| {
+                            self.entries
+                                .iter()
+                                .position(|entry| entry.path() == path.as_path())
+                        })
+                    })
+                    .or_else(|| initial_selection(&self.entries));
+                // FILTER stays authoritative over visibility regardless of
+                // which of the three branches above `selected` came from —
+                // a preserved-but-now-filtered-out selection is resettled
+                // exactly like any other, same as before this fix.
+                self.clamp_selection_to_filter();
+                // Only one of these two ever actually rebuilds PREVIEW —
+                // never both: `finish_preview_transition` already does so
+                // exactly when identity moved, so the explicit
+                // `refresh_preview()` below only runs in the one case it
+                // provably didn't (`created_inside_previewed_directory`,
+                // computed above from the *pre*-reload source, is only
+                // trusted when identity turns out to still be exactly what
+                // it was).
+                let preview_changed = if self.finish_preview_transition(previous_preview_source) {
+                    true
+                } else if created_inside_previewed_directory {
+                    self.refresh_preview();
+                    true
+                } else {
+                    false
+                };
+                CreateOutcome::Created(Update {
+                    current_changed: true,
+                    // Creating a new entry inside `current_dir` never
+                    // changes what PARENT shows (its own parent's listing,
+                    // highlighting `current_dir` itself) — same reasoning
+                    // `select_by`/`set_filter_query` already document.
+                    parent_changed: false,
+                    preview_changed,
+                })
+            }
+            Err(err) => CreateOutcome::Failed(err.to_string()),
+        }
+    }
+
+    /// Renames the currently selected entry's basename to `raw_input`, from
+    /// RENAME's editor text — called from `ui/window.rs`'s
+    /// `on_rename_accepted`. Same non-`Action` reasoning as
+    /// [`Self::create_entry`]. `raw_input` is used exactly as typed, with no
+    /// trimming — `core::operations::rename_entry`'s own
+    /// `validate_new_name` is the sole judge of whether it's a valid single
+    /// path component. `ui/window.rs` never opens RENAME's editor without a
+    /// selection or with a non-UTF-8 basename to prefill (see
+    /// `rename_prefill_name`), so [`RenameOutcome::NoSelection`] should be
+    /// unreachable in practice; it is still handled explicitly rather than
+    /// assumed away.
+    pub fn rename_selected(&mut self, raw_input: &str) -> RenameOutcome {
+        let Some(entry) = self.selected_entry() else {
+            return RenameOutcome::NoSelection;
+        };
+        let source = entry.path().to_path_buf();
+        match operations::rename_entry(&source, OsStr::new(raw_input)) {
+            Ok(renamed_path) => {
+                if renamed_path == source {
+                    // Same-basename success: `core::operations::rename_entry`
+                    // never touched the filesystem for this branch (see its
+                    // own doc comment), so there is nothing here to reload
+                    // either — no reload, no selection change, no PREVIEW
+                    // rebuild, and so `Update::NONE`, not merely
+                    // `preview_changed: false`.
+                    return RenameOutcome::Renamed(Update::NONE);
+                }
+                let previous_preview_source = self.preview_source_identity();
+                self.entries = self.navigation.entries().unwrap_or_default();
+                self.selected = self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.path() == renamed_path.as_path())
+                    .or_else(|| initial_selection(&self.entries));
+                self.clamp_selection_to_filter();
+                let preview_changed = self.finish_preview_transition(previous_preview_source);
+                RenameOutcome::Renamed(Update {
+                    current_changed: true,
+                    // Renaming stays within `current_dir`'s own listing —
+                    // never changes what PARENT shows, same reasoning as
+                    // `create_entry` above.
+                    parent_changed: false,
+                    preview_changed,
+                })
+            }
+            Err(err) => RenameOutcome::Failed(err.to_string()),
         }
     }
 
@@ -2676,4 +2891,445 @@ mod tests {
     // `preview_changed == false` — nothing about the stale session is
     // touched at all) — not duplicated here per the audit's own
     // instruction.
+
+    // --- CREATE (M5T-C2) --------------------------------------------------
+
+    #[test]
+    fn create_entry_with_empty_input_is_cancelled() {
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.create_entry("");
+
+        assert!(matches!(outcome, CreateOutcome::Cancelled));
+        assert_eq!(state.entries().len(), 0);
+    }
+
+    #[test]
+    fn create_entry_without_trailing_slash_creates_a_file() {
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.create_entry("new-file.txt");
+
+        assert!(matches!(outcome, CreateOutcome::Created(_)));
+        let created = dir.path().join("new-file.txt");
+        assert!(created.is_file());
+        assert_eq!(
+            state.selected_entry().map(FileEntry::path),
+            Some(created.as_path())
+        );
+    }
+
+    #[test]
+    fn create_entry_with_trailing_slash_creates_a_directory() {
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.create_entry("new-dir/");
+
+        assert!(matches!(outcome, CreateOutcome::Created(_)));
+        let created = dir.path().join("new-dir");
+        assert!(created.is_dir());
+        assert_eq!(
+            state.selected_entry().map(FileEntry::path),
+            Some(created.as_path())
+        );
+    }
+
+    #[test]
+    fn create_entry_does_not_trim_the_literal_input() {
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.create_entry("  padded.txt  ");
+
+        assert!(matches!(outcome, CreateOutcome::Created(_)));
+        assert!(dir.path().join("  padded.txt  ").is_file());
+    }
+
+    #[test]
+    fn create_entry_selects_the_new_entry_and_never_touches_parent() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("existing.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.create_entry("brand-new.txt");
+
+        match outcome {
+            CreateOutcome::Created(update) => {
+                assert!(update.current_changed);
+                assert!(!update.parent_changed);
+            }
+            other => panic!("expected Created, got {other:?}"),
+        }
+        assert_eq!(
+            state
+                .selected_entry()
+                .map(|e| e.name().to_string_lossy().into_owned()),
+            Some("brand-new.txt".to_string())
+        );
+    }
+
+    /// M5T-C2 V2 audit fix #1: creating something *inside* the directory
+    /// PREVIEW is already showing must refresh PREVIEW even though its
+    /// *source* (the previewed directory itself) never changes identity —
+    /// identity comparison alone (`finish_preview_transition`) cannot see a
+    /// content-only change.
+    ///
+    /// M5T-C2 V3 audit strengthening: the original version of this test
+    /// used "dir" as the *only* top-level entry, so `initial_selection()`
+    /// (the old, buggy nested-create fallback) happened to rediscover
+    /// "dir" anyway — masking exactly the V3 bug (a nested create falling
+    /// through to the first entry instead of preserving the previous
+    /// selection). This fixture has three top-level entries with "dir" not
+    /// first, and explicitly moves selection onto it before CREATE, so a
+    /// regression of the V3 fix would make this fail on `selected_entry`
+    /// alone, independent of whatever PREVIEW's own assertions below prove.
+    #[test]
+    fn create_inside_previewed_directory_refreshes_preview() {
+        let dir = TempDir::new();
+        fs::create_dir(dir.path().join("aaa")).unwrap();
+        fs::create_dir(dir.path().join("dir")).unwrap();
+        fs::write(dir.path().join("dir").join("old.txt"), b"").unwrap();
+        fs::write(dir.path().join("zzz.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        // Sorted (directories first, then alphabetically): "aaa", "dir",
+        // "zzz.txt" — the initial selection lands on "aaa", not "dir".
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("aaa"))
+        );
+        state.dispatch(Action::SelectNext);
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("dir"))
+        );
+        match state.preview() {
+            PreviewContext::Directory(children) => {
+                assert_eq!(children.len(), 1, "expected only old.txt before CREATE");
+            }
+            other => panic!("expected Directory preview, got {other:?}"),
+        }
+
+        let outcome = state.create_entry("dir/new.txt");
+
+        match outcome {
+            CreateOutcome::Created(update) => assert!(update.preview_changed),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // The selected entry is still "dir" itself — identity never moved,
+        // and crucially never fell back to "aaa" (the M5T-C2 V3 bug).
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("dir"))
+        );
+        match state.preview() {
+            PreviewContext::Directory(children) => {
+                let names: Vec<String> = children
+                    .iter()
+                    .map(|e| e.name().to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(names, vec!["new.txt".to_string(), "old.txt".to_string()]);
+            }
+            other => panic!("expected Directory preview, got {other:?}"),
+        }
+    }
+
+    /// M5T-C2 V3 audit: a nested create (`created_path` not itself a
+    /// top-level entry of `current_dir`) must preserve whatever was
+    /// selected before, by real path identity, rather than falling through
+    /// to `initial_selection` — dedicated from the PREVIEW test above so
+    /// this specific selection contract has its own, minimal proof,
+    /// independent of what PREVIEW happens to show. Three top-level
+    /// entries, "dir" deliberately not first (nor last), so this cannot
+    /// accidentally pass via `initial_selection()` or a lucky sort
+    /// position.
+    #[test]
+    fn create_nested_path_preserves_previous_selection() {
+        let dir = TempDir::new();
+        fs::create_dir(dir.path().join("aaa")).unwrap();
+        fs::create_dir(dir.path().join("dir")).unwrap();
+        fs::write(dir.path().join("zzz.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        // Sorted: "aaa", "dir", "zzz.txt" — select "dir" explicitly.
+        state.dispatch(Action::SelectNext);
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("dir"))
+        );
+
+        let outcome = state.create_entry("dir/new.txt");
+
+        assert!(
+            dir.path().join("dir").join("new.txt").is_file(),
+            "expected dir/new.txt to have been created on disk"
+        );
+        match outcome {
+            CreateOutcome::Created(_) => {}
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // Must still be "dir", never "aaa" (the old buggy
+        // `initial_selection` fallback) and never anything else.
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("dir"))
+        );
+    }
+
+    /// The counterpart proof: a sibling created elsewhere, irrelevant to
+    /// the directory currently selected/previewed, must not report a
+    /// PREVIEW change — content invalidation is scoped exactly to "created
+    /// inside the previewed directory", never a blanket "any CREATE
+    /// rebuilds PREVIEW". FILTER (`"dir"`) is what keeps "dir" selected
+    /// after the reload: the newly created "zzz.txt" would otherwise become
+    /// the freshly-created entry `create_entry` itself selects (see its own
+    /// doc comment), which would trivially also change identity and defeat
+    /// the point of this test.
+    #[test]
+    fn create_irrelevant_sibling_does_not_report_preview_change_when_selection_stays() {
+        let dir = TempDir::new();
+        fs::create_dir(dir.path().join("dir")).unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("dir".to_string()));
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("dir"))
+        );
+
+        let outcome = state.create_entry("zzz.txt");
+
+        match outcome {
+            CreateOutcome::Created(update) => assert!(!update.preview_changed),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // "zzz.txt" doesn't match the "dir" filter, so selection must have
+        // settled back onto "dir" rather than following the new entry.
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("dir"))
+        );
+        match state.preview() {
+            PreviewContext::Directory(children) => assert!(children.is_empty()),
+            other => panic!("expected an (empty) Directory preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_entry_conflict_leaves_the_filesystem_and_editor_state_untouched() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("exists.txt"), b"ORIGINAL").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let entries_before = state.entries().len();
+
+        let outcome = state.create_entry("exists.txt");
+
+        match outcome {
+            CreateOutcome::Failed(message) => assert!(!message.is_empty()),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(dir.path().join("exists.txt")).unwrap(),
+            b"ORIGINAL"
+        );
+        assert_eq!(state.entries().len(), entries_before);
+    }
+
+    #[test]
+    fn create_entry_rejecting_a_parent_component_is_failed_not_a_panic() {
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.create_entry("../escaped.txt");
+
+        assert!(matches!(outcome, CreateOutcome::Failed(_)));
+        assert!(!dir.path().parent().unwrap().join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn create_entry_preserves_an_active_filter_query() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("aaa.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("aaa".to_string()));
+
+        state.create_entry("zzz.txt");
+
+        assert_eq!(state.filter_query(), "aaa");
+    }
+
+    #[test]
+    fn create_entry_hidden_by_the_active_filter_falls_back_to_first_visible() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("aaa.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("aaa".to_string()));
+
+        // "zzz.txt" does not match the "aaa" filter, so it must not become
+        // selected even though it's now the newest entry.
+        state.create_entry("zzz.txt");
+
+        assert_eq!(
+            state
+                .selected_entry()
+                .map(|e| e.name().to_string_lossy().into_owned()),
+            Some("aaa.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn create_entry_is_a_free_function_call_not_an_action_variant() {
+        // Documents the architectural decision directly: CREATE never goes
+        // through `dispatch`/`Action` (see `create_entry`'s own doc
+        // comment) — there is deliberately no `Action::CreateEntry` variant
+        // to construct here, unlike every other state transition in this
+        // file's other tests.
+        let dir = TempDir::new();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let _: CreateOutcome = state.create_entry("standalone.txt");
+        assert!(dir.path().join("standalone.txt").exists());
+    }
+
+    // --- RENAME (M5T-C2) ---------------------------------------------------
+
+    #[test]
+    fn rename_selected_with_no_selection_returns_no_selection() {
+        let dir = TempDir::new(); // empty directory: nothing selected
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(state.selected(), None);
+
+        let outcome = state.rename_selected("anything.txt");
+
+        assert!(matches!(outcome, RenameOutcome::NoSelection));
+    }
+
+    #[test]
+    fn rename_selected_changes_basename_and_reselects_it() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("old.txt"), b"content").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.rename_selected("new.txt");
+
+        match outcome {
+            RenameOutcome::Renamed(update) => {
+                assert!(update.current_changed);
+                assert!(!update.parent_changed);
+            }
+            other => panic!("expected Renamed, got {other:?}"),
+        }
+        let renamed = dir.path().join("new.txt");
+        assert!(renamed.is_file());
+        assert!(!dir.path().join("old.txt").exists());
+        assert_eq!(
+            state.selected_entry().map(FileEntry::path),
+            Some(renamed.as_path())
+        );
+    }
+
+    #[test]
+    fn rename_selected_to_the_same_name_reports_update_none() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("same.txt"), b"content").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.rename_selected("same.txt");
+
+        match outcome {
+            RenameOutcome::Renamed(update) => assert_eq!(update, Update::NONE),
+            other => panic!("expected Renamed(Update::NONE), got {other:?}"),
+        }
+        assert!(dir.path().join("same.txt").exists());
+    }
+
+    #[test]
+    fn rename_selected_conflict_leaves_both_entries_and_selection_untouched() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("aaa.txt"), b"AAA").unwrap();
+        fs::write(dir.path().join("bbb.txt"), b"BBB").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        // Sorted alphabetically: "aaa.txt" is selected first.
+        let selected_before = state
+            .selected_entry()
+            .map(FileEntry::path)
+            .map(Path::to_path_buf);
+
+        let outcome = state.rename_selected("bbb.txt");
+
+        match outcome {
+            RenameOutcome::Failed(message) => assert!(!message.is_empty()),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(fs::read(dir.path().join("aaa.txt")).unwrap(), b"AAA");
+        assert_eq!(fs::read(dir.path().join("bbb.txt")).unwrap(), b"BBB");
+        assert_eq!(
+            state
+                .selected_entry()
+                .map(FileEntry::path)
+                .map(Path::to_path_buf),
+            selected_before
+        );
+    }
+
+    #[test]
+    fn rename_selected_rejects_an_empty_new_name() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+
+        let outcome = state.rename_selected("");
+
+        assert!(matches!(outcome, RenameOutcome::Failed(_)));
+        assert!(dir.path().join("a.txt").exists());
+    }
+
+    #[test]
+    fn rename_selected_preserves_an_active_filter_query() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("aaa.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("aaa".to_string()));
+
+        state.rename_selected("aaa-renamed.txt");
+
+        assert_eq!(state.filter_query(), "aaa");
+    }
+
+    #[test]
+    fn rename_selected_hidden_by_the_active_filter_falls_back_to_first_visible() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("aaa.txt"), b"").unwrap();
+        fs::write(dir.path().join("aaa-second.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        state.dispatch(Action::SetFilterQuery("aaa".to_string()));
+        // Sorted alphabetically, "-" (0x2D) sorts before "." (0x2E):
+        // "aaa-second.txt" is index 0 and so the initial selection.
+        assert_eq!(
+            state.selected_entry().map(FileEntry::name),
+            Some(std::ffi::OsStr::new("aaa-second.txt"))
+        );
+
+        // Renaming the selected "aaa-second.txt" to something the "aaa"
+        // filter no longer matches must not leave it selected-but-invisible.
+        state.rename_selected("zzz.txt");
+
+        assert_eq!(
+            state
+                .selected_entry()
+                .map(|e| e.name().to_string_lossy().into_owned()),
+            Some("aaa.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn rename_selected_is_a_free_function_call_not_an_action_variant() {
+        // Same architectural point as `create_entry_is_a_free_function_call_
+        // not_an_action_variant`: there is deliberately no
+        // `Action::RenameSelected` variant.
+        let dir = TempDir::new();
+        fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let mut state = test_state(Navigation::new(dir.path().to_path_buf()).unwrap());
+        let _: RenameOutcome = state.rename_selected("b.txt");
+        assert!(dir.path().join("b.txt").exists());
+    }
 }
