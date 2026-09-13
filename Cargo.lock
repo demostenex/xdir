@@ -5252,6 +5252,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "image",
+ "rustix 1.1.4",
  "slint",
  "slint-build",
 ]

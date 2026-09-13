@@ -35,6 +35,24 @@ image = { version = "0.25", default-features = false, features = [
 # by hand would just re-implement what this already gets right (shell
 # unescaping, `$HOME` interpolation, the disabled-directory convention).
 directories = "6.0.0"
+# Milestone 5T-C1 (create/rename core): a safe, zero-`unsafe`-in-xdir
+# wrapper around `renameat2`/`RENAME_NOREPLACE`, the only way to make
+# rename atomically refuse to overwrite an existing destination on Linux
+# (`std::fs::rename` alone can silently replace one — a `!exists()` check
+# first is a TOCTOU race, not a guarantee). Already present in the
+# dependency graph at this exact version (`cargo tree -i rustix@1.1.4`:
+# pulled in by `x11rb`/`zbus`/`async-io`/`softbuffer`/`polling`, all
+# beneath `i-slint-backend-winit`) — declared directly here at the same
+# 1.1.4 already locked, the same pattern `image` above already uses for
+# the same reason. `default-features = false` plus `fs` only: `fs` itself
+# adds no further dependencies of its own (empty feature-to-dependency
+# list in rustix's own `Cargo.toml`), so this changes nothing about what
+# gets built for anything else — it only exposes symbols already compiled
+# into the existing `rustix` unit for xdir's own code to call.
+rustix = { version = "1.1.4", default-features = false, features = [
+    "std",
+    "fs",
+] }
 
 [build-dependencies]
 slint-build = "1.17"
