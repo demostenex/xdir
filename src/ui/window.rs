@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::app::{Action, AppState, FilePreview, PreviewContext};
 use crate::model::{EntryKind, FileEntry};
@@ -110,14 +110,16 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
                 return false;
             };
             // `keymap.borrow_mut()` must not still be live once `apply`
-            // runs: a successful `GoSystemPlace`/`SelectFirst`/... syncs
-            // selection back through Slint's `current-item-changed`, which
-            // re-enters `on_selection_changed` below and calls
-            // `keymap.borrow_mut().cancel_pending()` — the same reentrancy
-            // hazard `apply`'s own doc comment describes for `state`. Using
-            // the temporary as the `match` scrutinee directly would extend
-            // its borrow across the whole match (including the `apply`
-            // call in this arm), so the result is copied out first.
+            // runs. Before M5V, a successful `GoSystemPlace`/`SelectFirst`/
+            // ... synced selection through `StandardListView`'s own
+            // `current-item-changed`, which re-entered `on_selection_changed`
+            // below and called `keymap.borrow_mut().cancel_pending()` — the
+            // same reentrancy hazard `apply`'s own doc comment describes for
+            // `state`. `apply` no longer routes through any callback that
+            // could do that (see its doc comment), but using the temporary
+            // as the `match` scrutinee directly would still extend its
+            // borrow across the whole match, so the result is copied out
+            // first regardless.
             let result = keymap.borrow_mut().resolve(stroke);
             match result {
                 KeymapResult::Action(action) => {
@@ -135,15 +137,13 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
         }
     });
 
-    // StandardListView's own click handling (built-in, and already
-    // left-button-only) moved the selection and scrolled it into view
-    // before this fires; this mirrors that into AppState through the same
-    // `apply` every other input goes through — a plain `dispatch` here
-    // (as before Milestone 3's PREVIEW pane) updated `AppState` correctly
-    // but never told `ui` to redraw PREVIEW, since only `apply` calls
-    // `refresh_preview`. `select_index`'s no-op-on-unchanged-index guard
-    // (see its doc comment) keeps this safe even though Slint's own
-    // `current-item-changed` already reflects the click.
+    // CURRENT's row `TouchArea` (see `ui/main.slint`) reports every left
+    // press here, unconditionally — including a repeat press on the
+    // already-selected row. `select_index`'s no-op-on-unchanged-index guard
+    // (see its doc comment) is what makes that safe: this mirrors the
+    // click into `AppState` through the same `apply` every other input goes
+    // through, exactly as before M5V's `StandardListView` replacement, and
+    // a redundant re-selection simply reports `Update::NONE`.
     //
     // A mouse selection is a fresh interaction unrelated to any in-flight
     // keyboard sequence, so it cancels a pending `g` first — otherwise `g`,
@@ -162,13 +162,11 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
         }
     });
 
-    // `current-item-changed` stays silent on a repeat click of the
-    // already-selected row, so double-click can't be detected from it.
-    // `item-pointer-event` fires on every press regardless — including
-    // right/middle clicks, which `ClickTracker` ignores outright but which
-    // still count as a fresh mouse interaction, so a pending `g` is
-    // cancelled here unconditionally too, before the click/button kind is
-    // even inspected.
+    // The row `TouchArea` reports every press here regardless of button —
+    // including right/middle clicks, which `ClickTracker` ignores outright
+    // but which still count as a fresh mouse interaction, so a pending `g`
+    // is cancelled here unconditionally too, before the click/button kind
+    // is even inspected.
     ui.on_item_pressed({
         let state = state.clone();
         let ui = ui.as_weak();
@@ -182,10 +180,9 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
             if outcome == ClickOutcome::Activate {
                 apply(&state, &ui, Action::ActivateIndex(index));
             }
-            // `Select` needs no action here: a left click on a new row is
-            // already selected via `current-item-changed` above, and a
-            // non-left press never selects anything (StandardListView's
-            // own click handling is left-button-only too).
+            // `Select` needs no action here: a left press already reports
+            // `selection-changed` on its own (see `ui/main.slint`'s row
+            // `TouchArea`), and a non-left press never selects anything.
         }
     });
 
@@ -206,24 +203,25 @@ pub fn run(state: AppState) -> Result<(), slint::PlatformError> {
 /// length-but-different-content listing.
 ///
 /// Neither this nor any helper it calls may hold a live `Ref`/`RefMut` on
-/// `state` while calling into `ui`: `invoke_set_selection` synchronously
-/// triggers `StandardListView::set-current-item`, which fires
-/// `current-item-changed` back into `on_selection_changed`, which itself
-/// calls `state.borrow_mut()`. A `SelectNext`/`SelectPrevious` used to hold
-/// `let st = state.borrow();` across exactly that call, so every plain
-/// `j`/`k` press re-entered the same `RefCell` and panicked ("already
-/// borrowed") — killing the whole process. Every helper below takes
-/// `&Rc<RefCell<AppState>>` and borrows only long enough to copy out the
-/// plain values it needs, so the borrow is gone before any `ui.*`/
-/// `invoke_*` call happens.
+/// `state` while calling into `ui`. Before M5V, syncing selection called
+/// `StandardListView::set-current-item`, which synchronously fired
+/// `current-item-changed` back into `on_selection_changed` — itself a
+/// `state.borrow_mut()` call. A `SelectNext`/`SelectPrevious` that held
+/// `let st = state.borrow();` across exactly that call re-entered the same
+/// `RefCell` and panicked ("already borrowed") — killing the whole
+/// process. `current-index`/`scroll-to-index` (M5V's own row-selection
+/// API, see `ui/main.slint`) are plain property writes and a function that
+/// only touches `viewport-y`; neither fires any callback back into Rust, so
+/// that specific reentrancy is no longer reachable through this call chain
+/// — but every helper below still borrows only long enough to copy out the
+/// plain values it needs, so the discipline holds regardless of how a
+/// future change might route selection back through a real callback.
 ///
-/// That same `sync_selection` round-trip is also why `select_by`/
-/// `select_index` in `AppState` treat re-selecting the already-selected
-/// index as a no-op: `sync_selection` below calls `invoke_set_selection`,
-/// which fires `current-item-changed` back into `on_selection_changed`,
-/// which dispatches `SelectIndex` a second time with the very index
-/// `AppState` just set — without that no-op check, PREVIEW would be
-/// rebuilt twice per keyboard press.
+/// `select_by`/`select_index` in `AppState` still treat re-selecting the
+/// already-selected index as a no-op independently of this: a mouse press
+/// on the already-current row calls `dispatch(SelectIndex(..))` with the
+/// same index `AppState` already holds (see `on_selection_changed` below),
+/// and without that no-op check PREVIEW would be rebuilt for nothing.
 fn apply(state: &Rc<RefCell<AppState>>, ui: &MainWindow, action: Action) {
     let update = state.borrow_mut().dispatch(action);
     if update.current_changed {
@@ -240,29 +238,34 @@ fn apply(state: &Rc<RefCell<AppState>>, ui: &MainWindow, action: Action) {
 }
 
 fn full_refresh_current(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
-    let (items, path_text, status_text, index) = {
+    let (rows, path_text, status_text, index) = {
         let st = state.borrow();
-        let items: Vec<StandardListViewItem> = st
+        let rows: Vec<EntryRow> = st
             .entries()
             .iter()
-            .map(|entry| StandardListViewItem::from(entry.name().to_string_lossy().as_ref()))
+            .map(|entry| EntryRow {
+                text: row_label(entry).into(),
+                icon: entry_icon(entry.kind()).into(),
+            })
             .collect();
         let path_text = st.current_dir().display().to_string();
         let status_text = format!("{} items", st.entries().len());
         let index = st.selected().map(|i| i as i32).unwrap_or(-1);
-        (items, path_text, status_text, index)
+        (rows, path_text, status_text, index)
         // `st` (the borrow) is dropped here, before any `ui`/`invoke_*` call.
     };
-    ui.set_entries(ModelRc::from(Rc::new(VecModel::from(items))));
+    ui.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
     ui.set_path_text(path_text.into());
     ui.set_status_text(status_text.into());
     ui.invoke_reset_scroll();
-    ui.invoke_set_selection(index);
+    ui.set_current_index(index);
+    ui.invoke_scroll_to_index(index);
 }
 
 fn sync_selection(state: &Rc<RefCell<AppState>>, ui: &MainWindow) {
     let index = state.borrow().selected().map(|i| i as i32).unwrap_or(-1);
-    ui.invoke_set_selection(index);
+    ui.set_current_index(index);
+    ui.invoke_scroll_to_index(index);
 }
 
 /// A row's display label: a trailing "/" for directories, the bare name
@@ -275,6 +278,30 @@ fn row_label(entry: &FileEntry) -> String {
         format!("{name}/")
     } else {
         name.into_owned()
+    }
+}
+
+/// CURRENT's leading glyph for `kind`, from the Nerd Font glyph set already
+/// bundled with `MesloLGS Nerd Font Mono`. xbar's own status icons (see
+/// `xbar/src/ui/view.rs`'s `audio_glyph`/`network_glyph`/etc.) draw from
+/// that font's Material Design Icons block instead (codepoints above
+/// `\u{f0000}`) — tried here first for consistency, but confirmed via this
+/// milestone's own smoke testing to render as missing-glyph boxes through
+/// Slint's `renderer-software` text shaping specifically (the exact same
+/// codepoints, same font file, render correctly through FreeType/Xft
+/// outside Slint — this is a Slint-side limitation, not a missing glyph or
+/// a wrong codepoint). Using the classic Font Awesome block instead (below
+/// `\u{f400}`, well inside the Basic Multilingual Plane) renders correctly
+/// in this app. Built here, never in `.slint` (which never inspects
+/// `EntryKind`), same rule as [`row_label`]. Deliberately coarse — one
+/// glyph per [`EntryKind`] variant, no MIME/extension/application lookup,
+/// no thumbnails.
+fn entry_icon(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Directory => "\u{f07b}", // nf-fa-folder
+        EntryKind::File => "\u{f016}",      // nf-fa-file-o
+        EntryKind::Symlink => "\u{f0c1}",   // nf-fa-link
+        EntryKind::Other => "\u{f059}",     // nf-fa-question-circle
     }
 }
 
@@ -495,6 +522,34 @@ mod tests {
         assert_eq!(clicks.register(3, true), ClickOutcome::Select);
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(clicks.register(3, true), ClickOutcome::Select);
+    }
+
+    #[test]
+    fn entry_icon_is_distinct_per_kind() {
+        let kinds = [
+            EntryKind::Directory,
+            EntryKind::File,
+            EntryKind::Symlink,
+            EntryKind::Other,
+        ];
+        let glyphs: Vec<&str> = kinds.iter().copied().map(entry_icon).collect();
+
+        // Every `EntryKind` gets its own glyph — no two kinds silently
+        // collapse to the same icon.
+        for (i, a) in glyphs.iter().enumerate() {
+            for b in &glyphs[i + 1..] {
+                assert_ne!(a, b, "kinds {kinds:?} must not share an icon");
+            }
+        }
+    }
+
+    #[test]
+    fn entry_icon_is_stable_for_the_same_kind() {
+        assert_eq!(
+            entry_icon(EntryKind::Directory),
+            entry_icon(EntryKind::Directory)
+        );
+        assert_eq!(entry_icon(EntryKind::File), entry_icon(EntryKind::File));
     }
 
     #[test]

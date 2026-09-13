@@ -1,4 +1,56 @@
-import { StandardListView, ListView } from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
+
+// Visual tokens translated from xbar's real visual material as it stands
+// in its working tree (`xbar/src/ui/style.rs`: `DOCK_BACKGROUND`,
+// `GLASS_MATERIAL`, `POPUP_STYLE` — inspected there directly, not assumed
+// from an earlier or a committed snapshot) — the same dark "glass"
+// language xbar's dock and popups already use, not a palette invented
+// independently for xdir:
+//
+//   background         <- DOCK_BACKGROUND / GLASS_MATERIAL.background rgb
+//   surface             <- POPUP_STYLE.card_background rgb (xbar's content-
+//                          card tone nested inside its popup shell)
+//   surface-subtle      <- the same `surface` tone at reduced alpha, for a
+//                          quieter indicator than `surface-selected`
+//   surface-hover       <- POPUP_STYLE.hover_background (rgb + alpha)
+//   surface-selected    <- BAR_STYLE.workspace_background — xbar's own
+//                          "this one is active" tone
+//   border              <- POPUP_STYLE.border
+//   text-primary        <- GLASS_MATERIAL.foreground
+//   text-secondary      <- POPUP_STYLE.muted_foreground
+//   accent              <- BAR_STYLE.workspace_foreground /
+//                          menu_hover_foreground ("emphasis white"); also
+//                          CURRENT's selected-row indicator bar (see below)
+//   radius              <- POPUP_STYLE.card_radius
+//
+// Exactly one set exists — no dark/light switch, no theme struct. A future
+// xdir/xbar/xomposite-wide theme system is out of scope here (see the M5V
+// decision note).
+//
+// `background`/`surface`/`surface-selected`/`border`/`text-primary`/
+// `text-secondary`/`accent` are fully opaque; `surface-hover` and
+// `surface-subtle` carry real alpha (translucent overlays meant to sit on
+// top of an opaque row, not a base surface of their own). None of this is
+// xomposite-mediated transparency — xdir does not participate in that
+// contract this milestone (see the M5V "XOMPOSITE CONTRACT DELTA NEEDED"
+// note — Slint/winit expose no small way to select an ARGB visual or set
+// `_NET_WM_WINDOW_OPACITY`/`_KDE_NET_WM_BLUR_BEHIND_REGION` from
+// application code today), so every *base* surface stays opaque and the
+// window stays legible with no compositor running at all.
+global Tokens {
+    out property <color> background: #20242b;
+    out property <color> surface: #2a303a;
+    out property <color> surface-subtle: #2a303a80;
+    out property <color> surface-hover: #5a687d72;
+    out property <color> surface-selected: #3a4352;
+    out property <color> border: #2b3340;
+    out property <color> text-primary: #e6eaf0;
+    out property <color> text-secondary: #7b8492;
+    out property <color> accent: #ffffff;
+    out property <length> radius: 7px;
+    out property <length> row-height: 26px;
+    out property <length> row-padding: 8px;
+}
 
 // A single row in the PARENT or PREVIEW-of-directory listings. Both are
 // read-only projections built entirely in Rust (`ui/window.rs`): `text` is
@@ -9,6 +61,15 @@ import { StandardListView, ListView } from "std-widgets.slint";
 struct ContextRow {
     text: string,
     highlighted: bool,
+}
+
+// A single CURRENT row: `text` is the same trailing-"/"-for-directories
+// label as `ContextRow`, and `icon` is a single Nerd Font glyph Rust picks
+// from `EntryKind` alone (see `ui/window.rs::entry_icon`) — `.slint` never
+// inspects `EntryKind` or decides glyphs itself, same rule as `ContextRow`.
+struct EntryRow {
+    text: string,
+    icon: string,
 }
 
 export component MainWindow inherits Window {
@@ -23,18 +84,21 @@ export component MainWindow inherits Window {
     // single-pane 1B/2 UI); still just an initial hint, not a constraint.
     preferred-width: 960px;
     preferred-height: 420px;
-    background: #1e1e2e;
-    // xdir's default typeface, resolved by the system's fontconfig (see
+    background: Tokens.background;
+    // xdir's global typeface, resolved by the system's fontconfig (see
     // `fc-match "MesloLGS Nerd Font Mono"`), for text that inherits the
-    // Window default rather than setting its own `font-family`. CURRENT's
-    // `StandardListView` delegate (the `fluent-dark` style's built-in
-    // `ListItem`) is a known exception: it does not inherit this value —
-    // see the M5B typography-limitation note.
+    // Window default rather than setting its own `font-family`. As of M5V,
+    // CURRENT is an authorial `ListView` composition (see below), so it
+    // inherits this like every other pane — the earlier `StandardListView`
+    // exception (its `fluent-dark` delegate never inherited this value) no
+    // longer applies to CURRENT specifically, but is kept as a documented
+    // fact about that widget in case it's ever reintroduced elsewhere.
     default-font-family: "MesloLGS Nerd Font Mono";
 
     in property <string> path-text: "";
     in property <string> status-text: "0 items";
-    in property <[StandardListViewItem]> entries;
+    in property <[EntryRow]> entries;
+    in property <int> current-index: -1;
 
     // PARENT: read-only context, never navigable. `has-parent` is an
     // explicit signal from Rust (current_dir().parent() being None at
@@ -82,15 +146,23 @@ export component MainWindow inherits Window {
     // button enum.
     callback item-pressed(int, bool);
 
-    // Moves the list's real selection (not just a bound property), which is
-    // the only path that also triggers StandardListView's own
-    // bring-into-view scrolling. A plain one-way `current-item` binding
-    // does not scroll the viewport.
-    public function set-selection(index: int) {
+    // Scrolls CURRENT's viewport just enough to bring `index` fully into
+    // view — the same "bring into view" math Slint's own `StandardListView`
+    // uses internally (`widgets/common/listview.slint::bring-into-view`),
+    // reimplemented here against our own fixed `Tokens.row-height` since
+    // CURRENT is no longer a `StandardListView`. `viewport-y` is a
+    // negative-going offset (0 at the top); this only ever *reduces* how
+    // far the target row is outside the visible range, never scrolls
+    // further than necessary.
+    public function scroll-to-index(index: int) {
         if (index < 0) {
-            current-list.current-item = -1;
-        } else {
-            current-list.set-current-item(index);
+            return;
+        }
+        if (current-list.viewport-y + index * Tokens.row-height < 0px) {
+            current-list.viewport-y = 0px - index * Tokens.row-height;
+        }
+        if (current-list.viewport-y + index * Tokens.row-height + Tokens.row-height > current-list.visible-height) {
+            current-list.viewport-y = current-list.visible-height - index * Tokens.row-height - Tokens.row-height;
         }
     }
 
@@ -108,10 +180,10 @@ export component MainWindow inherits Window {
     VerticalLayout {
         Rectangle {
             height: 30px;
-            background: #181825;
+            background: Tokens.surface;
             Text {
                 text: root.path-text;
-                color: #cdd6f4;
+                color: Tokens.text-primary;
                 x: 10px;
                 vertical-alignment: center;
             }
@@ -119,7 +191,7 @@ export component MainWindow inherits Window {
 
         Rectangle {
             height: 1px;
-            background: #313244;
+            background: Tokens.border;
         }
 
         HorizontalLayout {
@@ -131,17 +203,33 @@ export component MainWindow inherits Window {
             // selectable and focusable), so it can never steal keyboard
             // focus from CURRENT or turn a click into a selection/
             // navigation, with no extra "read-only" wrapping needed.
+            //
+            // Proportions are an initial visual ratio (PARENT 24 / CURRENT
+            // 38 / PREVIEW 38), not fixed widths — `horizontal-stretch`
+            // keeps them responsive to the window's real size. Each pane
+            // also pins `preferred-width`/`min-width` to `0px`: without
+            // that, `HorizontalLayout` first satisfies every child's own
+            // intrinsic minimum/preferred width (driven by its longest
+            // unwrapped row of text) before distributing the rest by
+            // stretch, so a pane with wider content quietly grabbed more
+            // than its share — confirmed via this milestone's own
+            // measurements (PARENT's real xbar filenames pushed it several
+            // points over 24%). Zeroing both makes every pane's width a
+            // pure function of `horizontal-stretch`, regardless of what its
+            // rows contain; overflowing text still elides/clips inside its
+            // own pane exactly as before.
             Rectangle {
-                horizontal-stretch: 25;
-                background: #1e1e2e;
+                horizontal-stretch: 24;
+                preferred-width: 0px;
+                min-width: 0px;
+                background: Tokens.background;
                 VerticalLayout {
                     Rectangle {
                         height: 20px;
-                        background: #181825;
+                        background: Tokens.surface;
                         Text {
                             text: "PARENT";
-                            color: #6c7086;
-                            font-size: 11px;
+                            color: Tokens.text-secondary;
                             x: 8px;
                             vertical-alignment: center;
                         }
@@ -149,10 +237,10 @@ export component MainWindow inherits Window {
                     if root.has-parent: ListView {
                         for row[i] in root.parent-entries: Rectangle {
                             height: 22px;
-                            background: row.highlighted ? #313244 : transparent;
+                            background: row.highlighted ? Tokens.surface-subtle : transparent;
                             Text {
                                 text: row.text;
-                                color: row.highlighted ? #cdd6f4 : #a6adc8;
+                                color: row.highlighted ? Tokens.text-primary : Tokens.text-secondary;
                                 x: 8px;
                                 vertical-alignment: center;
                             }
@@ -161,10 +249,9 @@ export component MainWindow inherits Window {
                     if !root.has-parent: Rectangle {
                         Text {
                             text: "(no parent)";
-                            color: #6c7086;
+                            color: Tokens.text-secondary;
                             x: 8px;
                             y: 6px;
-                            font-size: 12px;
                         }
                     }
                 }
@@ -173,22 +260,35 @@ export component MainWindow inherits Window {
             Rectangle {
                 width: 1px;
                 horizontal-stretch: 0;
-                background: #313244;
+                background: Tokens.border;
             }
 
             // CURRENT — the only operational pane: keyboard, selection,
-            // click and double-click all continue to work exactly as in
-            // Milestone 2.
+            // click and double-click all continue to work exactly as
+            // before M5V. Rendered as an authorial `ListView` + row
+            // delegate (Rectangle + icon + name + `TouchArea`) rather than
+            // `StandardListView`, so Meslo applies uniformly, hover/
+            // selected use xdir's own tokens instead of the toolkit's blue,
+            // and every row gets a leading `EntryKind` icon — see the M5V
+            // decision note for why `StandardListView` was replaced.
+            //
+            // `AppState` remains the sole authority over selection: this
+            // pane only reflects `root.current-index` (set by Rust after
+            // every `dispatch`) and reports raw interaction back through
+            // `selection-changed`/`item-pressed`, exactly the callbacks
+            // `StandardListView` used to drive. No selection state is
+            // duplicated or decided here.
             Rectangle {
-                horizontal-stretch: 45;
+                horizontal-stretch: 38;
+                preferred-width: 0px;
+                min-width: 0px;
                 VerticalLayout {
                     Rectangle {
                         height: 20px;
-                        background: #181825;
+                        background: Tokens.surface;
                         Text {
                             text: "CURRENT";
-                            color: #89b4fa;
-                            font-size: 11px;
+                            color: Tokens.text-secondary;
                             x: 8px;
                             vertical-alignment: center;
                         }
@@ -226,26 +326,106 @@ export component MainWindow inherits Window {
                                 }
                             }
 
-                            current-list := StandardListView {
+                            current-list := ListView {
                                 width: 100%;
                                 height: 100%;
-                                model: root.entries;
 
-                                // Fires only when the built-in click handling
-                                // actually changed the selection (it no-ops
-                                // on a repeat click of the already-selected
-                                // row) — used purely to mirror the resulting
-                                // selection into AppState.
-                                current-item-changed(index) => { root.selection-changed(index); }
+                                // CURRENT's visible height changes whenever
+                                // the window (or the pane) is resized —
+                                // `scroll-to-index` doesn't run on its own
+                                // just because the viewport moved, so
+                                // without this the selected row could end
+                                // up partially or fully outside the new
+                                // viewport until the next navigation action.
+                                // Re-running the same "bring into view" call
+                                // used after every selection change keeps it
+                                // visible across a resize too, with no
+                                // timer, poll, or animation — `scroll-to-
+                                // index` itself already no-ops (`index <
+                                // 0`) before any row exists.
+                                changed height => {
+                                    root.scroll-to-index(root.current-index);
+                                }
 
-                                // Fires on every mouse press on a row
-                                // regardless of whether the selection
-                                // changed, which is what a repeat click
-                                // needs — used only for double-click timing
-                                // on the Rust side.
-                                item-pointer-event(index, event, position) => {
-                                    if (event.kind == PointerEventKind.down) {
-                                        root.item-pressed(index, event.button == PointerEventButton.left);
+                                for row[i] in root.entries: Rectangle {
+                                    height: Tokens.row-height;
+                                    // The hover/selected background and the
+                                    // `TouchArea` hit rect below are the
+                                    // exact same `Rectangle` — one geometry,
+                                    // never drawn in one rect and hit-tested
+                                    // in another.
+                                    background: i == root.current-index
+                                        ? Tokens.surface-selected
+                                        : (touch.has-hover ? Tokens.surface-hover : transparent);
+                                    border-radius: Tokens.radius;
+
+                                    // `surface-selected` and `surface-hover`
+                                    // land close enough in perceived tone
+                                    // (both are muted slate) that the
+                                    // background alone doesn't reliably read
+                                    // as two different states — this left
+                                    // accent bar is xdir's own
+                                    // `Tokens.accent` (xbar's "emphasis
+                                    // white", the same tone its active-
+                                    // workspace/hovered-menu text already
+                                    // uses) and appears *only* for the
+                                    // selected row, never on hover, so the
+                                    // two states stay visually distinct
+                                    // without inventing a new color or
+                                    // reaching for toolkit blue.
+                                    if i == root.current-index: Rectangle {
+                                        x: 2px;
+                                        y: 3px;
+                                        width: 3px;
+                                        height: parent.height - 6px;
+                                        border-radius: 1.5px;
+                                        background: Tokens.accent;
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: Tokens.row-padding;
+                                        padding-right: Tokens.row-padding;
+                                        spacing: 6px;
+
+                                        Text {
+                                            text: row.icon;
+                                            color: Tokens.text-secondary;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 0;
+                                        }
+                                        Text {
+                                            text: row.text;
+                                            color: Tokens.text-primary;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+
+                                    touch := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        // Mirrors `StandardListView`'s own
+                                        // click handling: a left press
+                                        // always selects (re-selecting the
+                                        // already-current row is a no-op in
+                                        // `AppState::select_index`, so this
+                                        // never has to check `i ==
+                                        // current-index` itself); every
+                                        // press — left or not — is also
+                                        // reported to `item-pressed` for
+                                        // Rust's own double-click timing.
+                                        // Right/middle presses never select,
+                                        // matching the old left-button-only
+                                        // behavior.
+                                        pointer-event(event) => {
+                                            if (event.kind == PointerEventKind.down) {
+                                                if (event.button == PointerEventButton.left) {
+                                                    root.selection-changed(i);
+                                                }
+                                                root.item-pressed(i, event.button == PointerEventButton.left);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -257,7 +437,7 @@ export component MainWindow inherits Window {
             Rectangle {
                 width: 1px;
                 horizontal-stretch: 0;
-                background: #313244;
+                background: Tokens.border;
             }
 
             // PREVIEW — context only, same non-interactive `ListView`
@@ -265,16 +445,17 @@ export component MainWindow inherits Window {
             // other mode shows a plain contextual message instead, never
             // file content.
             Rectangle {
-                horizontal-stretch: 30;
-                background: #1e1e2e;
+                horizontal-stretch: 38;
+                preferred-width: 0px;
+                min-width: 0px;
+                background: Tokens.background;
                 VerticalLayout {
                     Rectangle {
                         height: 20px;
-                        background: #181825;
+                        background: Tokens.surface;
                         Text {
                             text: "PREVIEW";
-                            color: #6c7086;
-                            font-size: 11px;
+                            color: Tokens.text-secondary;
                             x: 8px;
                             vertical-alignment: center;
                         }
@@ -292,7 +473,7 @@ export component MainWindow inherits Window {
                             height: 22px;
                             Text {
                                 text: row.text;
-                                color: #a6adc8;
+                                color: Tokens.text-secondary;
                                 x: 8px;
                                 vertical-alignment: center;
                             }
@@ -322,12 +503,11 @@ export component MainWindow inherits Window {
                                 height: row-text.preferred-height + 4px;
                                 row-text := Text {
                                     text: row.text;
-                                    color: #a6adc8;
+                                    color: Tokens.text-secondary;
                                     x: 8px;
                                     y: 2px;
                                     width: parent.width - 16px;
                                     wrap: char-wrap;
-                                    font-size: 12px;
                                 }
                             }
                         }
@@ -335,9 +515,8 @@ export component MainWindow inherits Window {
                             height: 18px;
                             Text {
                                 text: "(truncated)";
-                                color: #6c7086;
+                                color: Tokens.text-secondary;
                                 x: 8px;
-                                font-size: 11px;
                                 vertical-alignment: center;
                             }
                         }
@@ -376,10 +555,9 @@ export component MainWindow inherits Window {
                     if root.preview-mode != "directory" && root.preview-mode != "text" && root.preview-mode != "image": Rectangle {
                         Text {
                             text: root.preview-label;
-                            color: #a6adc8;
+                            color: Tokens.text-secondary;
                             x: 8px;
                             y: 8px;
-                            font-size: 12px;
                             wrap: word-wrap;
                         }
                     }
@@ -389,25 +567,23 @@ export component MainWindow inherits Window {
 
         Rectangle {
             height: 1px;
-            background: #313244;
+            background: Tokens.border;
         }
 
         Rectangle {
             height: 24px;
-            background: #181825;
+            background: Tokens.surface;
             Text {
                 text: root.status-text;
-                color: #a6adc8;
+                color: Tokens.text-secondary;
                 x: 10px;
                 vertical-alignment: center;
-                font-size: 12px;
             }
             Text {
                 text: "NORMAL";
-                color: #a6adc8;
+                color: Tokens.text-secondary;
                 x: parent.width - self.width - 10px;
                 vertical-alignment: center;
-                font-size: 12px;
             }
         }
     }
